@@ -79,4 +79,8 @@ if __name__ == "__main__":
     os.makedirs('figures', exist_ok=True)
     save_path = 'figures/finite_size_scaling_mps.pdf'
     plt.savefig(save_path, dpi=300)
-    print(f"\nSuccess! Plot saved to {save_path}")
+    # The .tex includes the .png form of this figure, which the original
+    # script never wrote -- so Fig. 14 was stale/missing on recompile. Save
+    # the PNG too.
+    plt.savefig('figures/finite_size_scaling_mps.png', dpi=300)
+    print(f"\nSuccess! Plot saved to {save_path} (and .png)")

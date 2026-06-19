@@ -184,11 +184,15 @@ def main():
     ax.grid(True, ls=":")
     ax.legend()
     fig.tight_layout()
-    fig.savefig("figures/exact_dmax_scaling.pdf")
-    fig.savefig("figures/exact_dmax_scaling.png", dpi=300)
+    # The manuscript's Fig. 12 includes figures/depth_scaling.png, so write
+    # that name (this is the figure the .tex actually shows). The old
+    # exact_dmax_scaling.* name is kept as an alias for backward compat.
+    for base in ("figures/depth_scaling", "figures/exact_dmax_scaling"):
+        fig.savefig(base + ".pdf")
+        fig.savefig(base + ".png", dpi=300)
     plt.close(fig)
 
-    print("\nSaved: figures/exact_dmax_scaling.pdf")
+    print("\nSaved: figures/depth_scaling.{pdf,png} (and exact_dmax_scaling.*)")
     print("Regular D_max :", dict(zip(system_sizes, dmax_regular)))
     print("Chaotic D_max :", dict(zip(system_sizes, dmax_chaotic)))
     print("Regular ceiling hit:", dict(zip(system_sizes, ceiling_reg)))
