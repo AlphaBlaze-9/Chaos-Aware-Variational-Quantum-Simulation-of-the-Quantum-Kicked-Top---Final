@@ -1,0 +1,11 @@
+# Core numerics (required for all simulation modules)
+numpy>=1.23
+scipy>=1.9
+matplotlib>=3.6
+
+# Optional: circuit-framework sandbox (simulation.py)
+# cirq>=1.3
+
+# Optional: real IBM Quantum hardware interface (hardware_manager.py)
+# qiskit>=1.0
+# qiskit-ibm-runtime>=0.20

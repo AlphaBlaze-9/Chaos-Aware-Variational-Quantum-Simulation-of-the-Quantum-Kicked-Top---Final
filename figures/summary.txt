@@ -1,0 +1,2 @@
+Estimated first k where mean FTLE > 0 (smoothed): None
+Parameters: p=1.5707963267948966, steps=1500, burn-in=150, n_seeds=8
