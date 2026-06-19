@@ -1,5 +1,3 @@
-
-
 import numpy as np
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -72,6 +70,48 @@ def sweep_k(
     M_consec: int = 2,                 
     max_depth: int = 8,
 ):
+    # IMPORTANT: the Dmax computed in this function is max(depth history) of
+    # the *adaptive McLachlan integrator* (run_adaptive_floquet), triggered
+    # by residual_threshold and capped at max_depth. This is NOT the same
+    # quantity as the direct-optimization Dmax (Sec. II.E.4 of the
+    # manuscript / Fig. 10), which is obtained independently via L-BFGS-B
+    # over circuit parameters with no integrator involved at all. The two
+    # can disagree, and the manuscript's central monotonicity claim is
+    # about the direct-optimization Dmax, not this integrator-based one.
+    # If you are using the output of this script to investigate referee
+    # points #2 (k-resolution) or #8 (Dmax=3 plateau at k=2.5, k=3.0), make
+    # sure you are looking at the same Dmax definition the manuscript text
+    # actually claims monotonicity for -- cross-check against the
+    # direct-optimization pipeline (adapt_vqa_baseline.layerwise_prepare or
+    # equivalent) before drawing conclusions from this script alone.
+    #
+    # BUG FIX: this previously called run_adaptive_floquet with
+    # compute_exact_diag=True. Looking at adaptive_vqs_qkt.py's actual
+    # trigger logic:
+    #
+    #     if compute_exact_diag:
+    #         trigger_metric = 1.0 - fidelity   # exact-state infidelity
+    #         active_thresh = 0.45              # HARDCODED, ignores
+    #                                            # residual_threshold entirely
+    #     else:
+    #         trigger_metric = peak_r2          # the McLachlan residual
+    #         active_thresh = residual_threshold
+    #
+    # compute_exact_diag=True silently switches the trigger from the
+    # McLachlan residual (what residual_threshold=0.80 was meant to
+    # control) to exact-state infidelity against a HARDCODED 0.45
+    # threshold that residual_threshold has no effect on at all. An
+    # infidelity threshold of 0.45 is aggressive enough that a D=1 ansatz
+    # trips it almost every period even in the regular regime, which is
+    # why the previous run produced D_max=8 (the ceiling) at every single
+    # k, including k=0.5. Setting compute_exact_diag=False restores the
+    # actual residual-threshold-driven trigger this sweep is supposed to
+    # be testing. Exact fidelity is no longer computed at all in this mode
+    # (out["fid_diag"] will be NaN); if you want exact-fidelity diagnostics
+    # alongside a residual-driven trigger, that requires editing
+    # adaptive_vqs_qkt.run_adaptive_floquet itself so the two are
+    # decoupled (diagnostic-only fidelity tracking that does NOT also
+    # override active_thresh), which is out of scope for this file.
     dmax_list  = []
     ftle_list  = []
 
@@ -83,7 +123,7 @@ def sweep_k(
             residual_threshold=residual_threshold,
             M_consec=M_consec,
             max_depth=max_depth,
-            compute_exact_diag=True,
+            compute_exact_diag=False,
         )
         
         print(f"  depth history: {result['depth']}")
@@ -132,6 +172,10 @@ def plot_dmax_vs_k(k_values, dmax, ftle,
 
     ax1.grid(True, ls=":", alpha=0.45)
     ax1.set_xticks(k_values)
+    # With a finer k-grid (referee point #2) there can be more than 7
+    # tick labels; rotate them so they stay legible instead of overlapping.
+    if len(k_values) > 7:
+        ax1.tick_params(axis="x", labelrotation=45)
 
     fig.savefig(outfile + ".pdf", bbox_inches="tight")
     fig.savefig(outfile + ".png", dpi=300, bbox_inches="tight")
@@ -139,7 +183,15 @@ def plot_dmax_vs_k(k_values, dmax, ftle,
     print(f"\nSaved {outfile}.pdf / .png")
 
 if __name__ == "__main__":
-    K_VALUES = np.array([0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5])
+    # Higher-resolution kick-strength grid (referee point #2): the original
+    # 7-point grid [0.5, 1.0, ..., 3.5] produced a coarse Dmax staircase
+    # that left it unclear whether Dmax(k) is genuinely monotonic or just
+    # non-decreasing at low resolution. The added points (1.75, 2.25, 2.75,
+    # 3.25) sit inside the regions of fastest FTLE growth and around the
+    # k=2.5/k=3.0 Dmax=3 plateau (referee point #8), where extra resolution
+    # is most informative.
+    K_VALUES = np.array([0.5, 1.0, 1.5, 1.75, 2.0, 2.25,
+                          2.5, 2.75, 3.0, 3.25, 3.5])
     N        = 6
     STEPS    = 12
 
@@ -148,6 +200,30 @@ if __name__ == "__main__":
 
     print("\nResults:")
     for k, d, l in zip(K_VALUES, dmax, ftle):
-        print(f"  k={k:.1f}  D_max={d}  lambda_FTLE={l:+.4f}")
+        print(f"  k={k:.2f}  D_max={d}  lambda_FTLE={l:+.4f}")
+
+    # Explicit monotonicity check, so the manuscript claim ("Dmax grows
+    # monotonically with the Lyapunov exponent") is verified against the
+    # actual data rather than asserted from a quick visual read of the plot.
+    diffs = np.diff(dmax)
+    is_monotonic_nondecreasing = bool(np.all(diffs >= 0))
+    is_strictly_increasing = bool(np.all(diffs > 0))
+    print(f"\nDmax sequence: {list(dmax)}")
+    print(f"Non-decreasing (weakly monotonic): {is_monotonic_nondecreasing}")
+    print(f"Strictly increasing at every step: {is_strictly_increasing}")
+    if not is_monotonic_nondecreasing:
+        bad = [(K_VALUES[i], K_VALUES[i+1], dmax[i], dmax[i+1])
+               for i in range(len(diffs)) if diffs[i] < 0]
+        print("WARNING: Dmax DECREASES at the following k transitions "
+              "-- the monotonicity claim does NOT hold as stated and the "
+              "manuscript text needs to be revised:")
+        for k1, k2, d1, d2 in bad:
+            print(f"    k={k1:.2f} (Dmax={d1}) -> k={k2:.2f} (Dmax={d2})")
+    elif not is_strictly_increasing:
+        flat = [(K_VALUES[i], K_VALUES[i+1], dmax[i])
+                for i in range(len(diffs)) if diffs[i] == 0]
+        print("Dmax is non-decreasing but has plateaus (ties) at:")
+        for k1, k2, d in flat:
+            print(f"    k={k1:.2f} -> k={k2:.2f}, both Dmax={d}")
 
     plot_dmax_vs_k(K_VALUES, dmax, ftle)
