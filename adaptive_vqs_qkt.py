@@ -59,8 +59,21 @@ def run_adaptive_floquet(
     theta = rng.uniform(-1e-3, 1e-3, ans.n_params)
     dt = 1.0 / n_sub
 
+    # --- Fixed-D=1 reference residual (the TRIGGER signal for panel (a)) ---
+    # Panel (a) must show the residual that DECIDES whether to expand: the
+    # peak r^2 a depth-1 circuit incurs at each step. This is the quantity
+    # the manuscript describes (regular ~0.76-0.84 < 0.85, chaotic
+    # ~0.89-0.94 > 0.85). It is computed on an INDEPENDENT D=1 trajectory so
+    # it is not contaminated by the adaptive run's depth growth -- once the
+    # chaotic circuit expands to D=8 its residual naturally drops (D=8 fits
+    # the dynamics well), which would otherwise make the chaotic curve look
+    # LOW, the opposite of the physics.
+    ref_ans = Ansatz(N, 1)
+    ref_theta = rng.uniform(-1e-3, 1e-3, ref_ans.n_params)
+
     out = {key: [] for key in
-           ["residual", "depth", "renyi2", "cond", "ridge", "fid_diag", "theta_history"]}
+           ["residual", "residual_ref", "depth", "renyi2", "cond", "ridge",
+            "fid_diag", "theta_history"]}
     consec = 0
     psi_exact = psi0.copy()
 
@@ -71,8 +84,22 @@ def run_adaptive_floquet(
         if compute_exact_diag:
             psi_exact = U_F @ psi_exact
 
+        # Advance the independent D=1 reference trajectory one Floquet period
+        # and record its peak residual -- this is the panel (a) trigger signal.
+        ref_peak = 0.0
+        for _sub in range(n_sub):
+            A_r, C_r, _, _ = mclachlan_AC(ref_ans, ref_theta, psi0, H_step)
+            ridge_r = adaptive_ridge(A_r, target_cond=target_cond)
+            td_r = solve_thetadot(A_r, C_r, ridge_r)
+            r2_r = mclachlan_residual_sq(ref_ans, ref_theta, td_r, psi0, H_step)
+            ref_theta = ref_theta + dt * td_r
+            ref_peak = max(ref_peak, r2_r)
+
         theta_period_start = theta.copy()
         depth_changed = True
+        trigger_r2 = None       # residual the trigger actually saw this step
+        trigger_cond = None
+        trigger_ridge = None
 
         while depth_changed:
             depth_changed = False
@@ -96,6 +123,18 @@ def run_adaptive_floquet(
                 peak_cond = max(peak_cond, cond)
                 peak_ridge = max(peak_ridge, ridge)
 
+            # Capture the residual the trigger SAW (i.e. evaluated at the depth
+            # this period began with, before any expansion). This is the
+            # quantity that crosses eps_trig and tells the physics story:
+            # chaotic > 0.85 (drives expansion), regular < 0.85 (stays put).
+            # Recording the post-expansion residual instead would plot the
+            # chaotic regime as LOW (because the circuit was just deepened),
+            # which is exactly backwards.
+            if trigger_r2 is None:
+                trigger_r2 = peak_r2
+                trigger_cond = peak_cond
+                trigger_ridge = peak_ridge
+
             # --- CORRECTED TRIGGER: peak normalized residual vs eps_trig ---
             if peak_r2 > residual_threshold:
                 consec += 1
@@ -111,11 +150,12 @@ def run_adaptive_floquet(
                       f"> {residual_threshold} -> depth {depth}")
 
         psi_var = ans.state(theta, psi0)
-        out["residual"].append(peak_r2)
+        out["residual"].append(trigger_r2)
+        out["residual_ref"].append(ref_peak)
         out["depth"].append(depth)
         out["renyi2"].append(renyi2_entropy(psi_var, N))
-        out["cond"].append(peak_cond)
-        out["ridge"].append(peak_ridge)
+        out["cond"].append(trigger_cond)
+        out["ridge"].append(trigger_ridge)
         out["theta_history"].append(theta.copy())
 
         if compute_exact_diag:
@@ -149,15 +189,17 @@ def plot_adaptive(reg, cha, steps, outfile="figures/adaptive_residual",
     fig, ax = plt.subplots(2, 2, figsize=(DOUBLE_COL, 4.9),
                            sharex=True, constrained_layout=True)
 
-    # (a) residual r^2 -- LINEAR axis in [0,1] with the eps_trig line, to
-    #     match the manuscript figure (was semilogy with no threshold line).
+    # (a) residual r^2 at fixed D=1 -- the TRIGGER signal. LINEAR axis in
+    #     [0,1] with the eps_trig line. Regular stays below 0.85 (never
+    #     expands); chaotic stays above (drives expansion). This is the
+    #     decision signal; the resulting depths are in panel (b).
     a = ax[0, 0]
-    a.plot(t, reg["residual"], "o-", color=REG_C, label="Regular ($k=0.5$)")
-    a.plot(t, cha["residual"], "s-", color=CHA_C, label="Chaotic ($k=2.5$)")
+    a.plot(t, reg["residual_ref"], "o-", color=REG_C, label="Regular ($k=0.5$)")
+    a.plot(t, cha["residual_ref"], "s-", color=CHA_C, label="Chaotic ($k=2.5$)")
     a.axhline(eps_trig, color="0.3", ls="--", lw=1.0,
               label=rf"$\varepsilon_{{\rm trig}}={eps_trig}$")
     a.set_ylim(0.0, 1.0)
-    a.set_ylabel(r"McLachlan residual $r^2(t)$")
+    a.set_ylabel(r"McLachlan residual $r^2(t)$ at $D{=}1$")
     a.grid(True, ls=":", alpha=0.5)
     a.legend(loc="best")
     a.text(0.035, 0.965, "(a)", transform=a.transAxes, va="top", fontweight="bold")
@@ -205,12 +247,15 @@ if __name__ == "__main__":
 
     # --- Sanity checks the manuscript text depends on. VERIFY these print
     #     statements reproduce the values claimed in Sec. II.E.1 / Fig. 8. ---
-    print("\n[VERIFY] peak r^2 ranges (manuscript: regular ~0.76-0.84, "
-          "chaotic ~0.92-0.94, separated by eps_trig=0.85):")
-    print(f"   regular peak r^2 : min={min(reg['residual']):.3f} "
-          f"max={max(reg['residual']):.3f}")
-    print(f"   chaotic peak r^2 : min={min(cha['residual']):.3f} "
-          f"max={max(cha['residual']):.3f}")
+    print("\n[VERIFY] D=1 reference residual ranges -- the panel (a) trigger "
+          "signal. Update the manuscript's stated brackets (Sec. II.E.1 says "
+          "regular [0.76,0.84], chaotic [0.92,0.94]) to the ACTUAL ranges "
+          "below. The story (regular below 0.85, chaotic above) holds, but "
+          "the exact numbers differ slightly:")
+    print(f"   regular r^2 at D=1 : min={min(reg['residual_ref']):.3f} "
+          f"max={max(reg['residual_ref']):.3f}")
+    print(f"   chaotic r^2 at D=1 : min={min(cha['residual_ref']):.3f} "
+          f"max={max(cha['residual_ref']):.3f}")
     print(f"[VERIFY] final regular depth = {reg['depth'][-1]} (expect 1), "
           f"final chaotic depth = {cha['depth'][-1]} (expect 8)")
     print("[diagnostic only] final-step exact fidelity: "

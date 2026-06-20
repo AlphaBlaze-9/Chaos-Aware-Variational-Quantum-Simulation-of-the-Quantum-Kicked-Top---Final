@@ -1,162 +1,102 @@
 import os
 import numpy as np
 import matplotlib.pyplot as plt
+from scipy.optimize import minimize
 
-from vqs import (
-    Ansatz,
-    mclachlan_AC,
-    solve_thetadot,
-    adaptive_ridge,
-    floquet_step_generator,
-)
+from vqs import Ansatz
 from spin_operators import coherent_product_state, normalize
 from qkt_quantum import floquet_U_exact
 
 
+# =====================================================================
+# D_max vs system size, via DIRECT optimization.
+#
+# IMPORTANT FIX: the previous version of this script computed D_max with the
+# McLachlan *integrator* (expand depth while the residual stays high). That
+# integrator does NOT track the Floquet state in this repository -- its
+# residual never settles below the 0.05 target even at depth 16, so every
+# point just ran to the depth ceiling and the "D_max" it reported was the
+# ceiling, not a converged depth. (You can see this in the old console
+# output: "after settling: r^2=0.46" at depth 16, still nowhere near 0.05.)
+#
+# This is the SAME conceptual error that was fixed for Fig. 10: D_max must be
+# the minimum depth at which DIRECT optimization can represent U_F^t|psi0> to
+# infidelity <= eps_opt, independent of any integrator. This version uses that
+# definition, so it is consistent with Fig. 10 and actually converges.
+# =====================================================================
 
-EPSILON      = 0.05
-# NOTE on convention: this script expands depth WHILE r2 > EPSILON, i.e. it
-# keeps adding layers until the normalized residual drops below 0.05 -- a
-# "converge well" criterion. This is the opposite sense from the
-# manuscript's adaptive trigger (Sec. II.E.1), which expands depth only
-# once r2 EXCEEDS a high failure threshold (varepsilon_trig=0.85) and
-# otherwise tolerates a fairly large residual. The two are not the same
-# definition of "D_max" -- this script's D_max answers "how deep must the
-# circuit be for the residual to nearly vanish," while the manuscript's
-# adaptive integrator answers "how deep before the residual stops being
-# clearly too large." Keep this distinction in mind when comparing numbers
-# from this script against Fig. 4/Fig. 8 of the manuscript.
-DT           = 0.30
-N_STEPS      = 10
+EPS_OPT      = 0.05
+N_STEPS      = 10          # Floquet steps in the time window t in {1,...,N_STEPS}
 K_CHAOTIC    = 2.5
 K_REGULAR    = 0.5
-SEED         = 0
-N_SETTLE     = 8
-DT_SETTLE    = 0.30
-
-# Depth ceiling, expressed as N + CEILING_OFFSET. The original ceiling of
-# N+6 caused the chaotic-regime points at N=8 and N=10 to saturate before
-# the McLachlan integrator could converge, producing lower bounds rather
-# than true D_max values (see referee point #3). Raising the offset gives
-# the chaotic trajectories more room to actually converge. This is still a
-# finite ceiling, not an unbounded one, both because circuit depth must
-# stay finite for the comparison to mean anything and because the
-# Tikhonov-regularized linear solve becomes increasingly expensive and
-# numerically delicate at very large depth.
-CEILING_OFFSET = 15
+N_RESTARTS   = 12
+MAX_DEPTH    = 12          # finite ceiling; points that hit it are lower bounds
 
 
+def dmax_direct(N, k, steps=N_STEPS, eps_opt=EPS_OPT,
+                max_depth=MAX_DEPTH, n_restarts=N_RESTARTS):
+    psi0 = coherent_product_state(N)
+    U_F  = floquet_U_exact(N, k, np.pi / 2)
+    fid_target = 1.0 - eps_opt
 
+    dmax = 0
+    ceiling_hit = False
+    psi_t = psi0.copy()
+    for t in range(1, steps + 1):
+        psi_t = normalize(U_F @ psi_t)
 
-def _mclachlan(ansatz, theta, psi0, H):
-    A, C, psi_th, _ = mclachlan_AC(ansatz, theta, psi0, H)
-    H_sq  = float(np.real(np.vdot(psi_th, H @ H @ psi_th)))
-    ridge = adaptive_ridge(A)
-    return A, C, H_sq, ridge, psi_th
+        # minimum depth that reaches the target infidelity for THIS t
+        depth_t, hit_t = max_depth, True
+        for D in range(1, max_depth + 1):
+            ans = Ansatz(N, D)
 
+            def cost(th):
+                psi = ans.state(th, psi0)
+                return 1.0 - abs(np.vdot(psi_t, psi)) ** 2
 
-def _r2_and_td(A, C, H_sq, ridge):
-    td = solve_thetadot(A, C, ridge)
-    raw_residual = float(np.dot(td, A @ td) - 2.0 * np.dot(td, C) + H_sq)
-    # BUG FIX: this previously returned raw_residual directly, without
-    # dividing by H_sq = <psi|H_eff^2|psi>. The manuscript's normalized
-    # residual r^2 (Eq. 11) and vqs.py's own mclachlan_residual_sq() both
-    # divide by this quantity so that r^2 is bounded in [0,1]; without it,
-    # this function was returning an unnormalized number that generically
-    # sits well above EPSILON=0.05 regardless of k, which is why the
-    # regular (k=0.5) and chaotic (k=2.5) regimes were behaving
-    # identically and both saturating the depth ceiling in the D_max-vs-N
-    # plot -- the trigger was firing almost every step in both regimes,
-    # not just the chaotic one. Dividing by H_sq restores the actual
-    # bounded [0,1] residual that the rest of the threshold logic
-    # (EPSILON=0.05) was designed around.
-    r2 = raw_residual / (float(H_sq) + 1e-15)
-    return r2, td
+            best_fid = -np.inf
+            for r in range(n_restarts):
+                rng = np.random.default_rng((N, t, D, r))
+                x0 = rng.uniform(0, 2 * np.pi, ans.n_params)
+                res = minimize(cost, x0, method="L-BFGS-B",
+                               options={"maxiter": 300})
+                best_fid = max(best_fid, 1.0 - res.fun)
+            if best_fid >= fid_target:
+                depth_t, hit_t = D, False
+                break
 
+        dmax = max(dmax, depth_t)
+        if hit_t:
+            ceiling_hit = True
+        print(f"   N={N} k={k} t={t:2d}: min sufficient depth={depth_t} "
+              f"{'(ceiling, lower bound)' if hit_t else ''}", flush=True)
 
-def _settle(ansatz, theta, psi0, H, n_steps, dt):
-    for _ in range(n_steps):
-        A, C, H_sq, ridge, _ = _mclachlan(ansatz, theta, psi0, H)
-        td    = solve_thetadot(A, C, ridge)
-        theta = theta + dt * td
-    A, C, H_sq, ridge, _ = _mclachlan(ansatz, theta, psi0, H)
-    r2, td = _r2_and_td(A, C, H_sq, ridge)
-    return theta, r2, td
-
-
-def run_adaptive_vqs(N, k, steps, dt=DT, epsilon=EPSILON,
-                     n_settle=N_SETTLE, dt_settle=DT_SETTLE,
-                     ceiling_offset=CEILING_OFFSET):
-    max_depth = N + ceiling_offset
-
-    np.random.seed(SEED)
-    H_step = floquet_step_generator(N, k, np.pi / 2)
-    U_F    = floquet_U_exact(N, k, np.pi / 2)
-    psi0   = coherent_product_state(N)
-    depth  = 1
-    ansatz = Ansatz(N, depth)
-    theta  = np.zeros(ansatz.n_params)
-    depth_history = []
-
-    for step in range(steps):
-        A, C, H_sq, ridge, _ = _mclachlan(ansatz, theta, psi0, H_step)
-        r2, td = _r2_and_td(A, C, H_sq, ridge)
-
-        while r2 > epsilon and depth < max_depth:
-            depth  += 1
-            ansatz  = Ansatz(N, depth)
-            theta   = np.concatenate(
-                [theta, np.zeros(ansatz.n_params - len(theta))])
-            print(f"   N={N}, k={k}, step {step+1}: r^2={r2:.4f} "
-                  f"-> depth {depth}, settling...")
-            theta, r2, td = _settle(
-                ansatz, theta, psi0, H_step, n_settle, dt_settle)
-            print(f"      after settling: r^2={r2:.4f}")
-
-        depth_history.append(depth)
-
-        A, C, H_sq, ridge, _ = _mclachlan(ansatz, theta, psi0, H_step)
-        td    = solve_thetadot(A, C, ridge)
-        theta = theta + dt * td
-        psi0  = normalize(U_F @ psi0)
-
-    dmax = max(depth_history)
-
-    # Fixed: this used to hardcode "N + 6" independently of max_depth, so
-    # if the ceiling formula above ever changed, this check would silently
-    # go stale and misreport whether the depth ceiling was actually hit.
-    # It now always reflects the ceiling that was actually used this run.
-    ceiling_hit = dmax >= max_depth
-    return depth_history, dmax, ceiling_hit
+    return dmax, ceiling_hit
 
 
 def main():
     system_sizes = [4, 6, 8, 10]
-    dmax_chaotic = []
-    dmax_regular = []
-    ceiling_cha  = []
-    ceiling_reg  = []
+    dmax_chaotic, dmax_regular = [], []
+    ceiling_cha, ceiling_reg = [], []
 
     os.makedirs("figures", exist_ok=True)
 
     for N in system_sizes:
         print(f"\n{'='*50}")
         print(f"N={N}  |  chaotic (k={K_CHAOTIC})...")
-        _, dmax, hit = run_adaptive_vqs(N, K_CHAOTIC, steps=N_STEPS)
+        dmax, hit = dmax_direct(N, K_CHAOTIC)
         print(f"-> D_max={dmax}  ceiling_hit={hit}")
         dmax_chaotic.append(dmax)
         ceiling_cha.append(hit)
 
         print(f"N={N}  |  regular (k={K_REGULAR})...")
-        _, dmax, hit = run_adaptive_vqs(N, K_REGULAR, steps=N_STEPS)
+        dmax, hit = dmax_direct(N, K_REGULAR)
         print(f"-> D_max={dmax}  ceiling_hit={hit}")
         dmax_regular.append(dmax)
         ceiling_reg.append(hit)
 
-    
     fig, ax = plt.subplots(figsize=(6, 4))
 
-    
     ax.plot(system_sizes, dmax_regular, "o-", color="#0072B2",
             label="Regular (k=0.5)")
     for i, hit in enumerate(ceiling_reg):
@@ -164,7 +104,6 @@ def main():
             ax.plot(system_sizes[i], dmax_regular[i], "o",
                     color="#0072B2", mfc="none", ms=10)
 
-    
     ax.plot(system_sizes, dmax_chaotic, "s-", color="#D55E00",
             label="Chaotic (k=2.5)")
     for i, hit in enumerate(ceiling_cha):
@@ -174,19 +113,15 @@ def main():
 
     ax.set_xlabel("System Size $N$ (qubits)")
     ax.set_ylabel(r"Maximum Adaptive Depth $D_{\max}$")
-    ax.set_title(
-        rf"$D_{{\max}}$ vs. System Size (depth ceiling $= N+{CEILING_OFFSET}$)")
+    ax.set_title(r"$D_{\max}$ vs. System Size (direct optimization)")
     ax.set_xticks(system_sizes)
-    ax.text(0.55, 0.12,
-            "open markers: depth ceiling reached (lower bound, not\n"
-            "a converged $D_{\\max}$)",
+    ax.text(0.50, 0.10,
+            "open markers: depth ceiling reached\n(lower bound, not converged $D_{\\max}$)",
             transform=ax.transAxes, fontsize=7.5, color="gray")
     ax.grid(True, ls=":")
     ax.legend()
     fig.tight_layout()
-    # The manuscript's Fig. 12 includes figures/depth_scaling.png, so write
-    # that name (this is the figure the .tex actually shows). The old
-    # exact_dmax_scaling.* name is kept as an alias for backward compat.
+    # The manuscript's Fig. 12 includes figures/depth_scaling.png.
     for base in ("figures/depth_scaling", "figures/exact_dmax_scaling"):
         fig.savefig(base + ".pdf")
         fig.savefig(base + ".png", dpi=300)
@@ -195,16 +130,9 @@ def main():
     print("\nSaved: figures/depth_scaling.{pdf,png} (and exact_dmax_scaling.*)")
     print("Regular D_max :", dict(zip(system_sizes, dmax_regular)))
     print("Chaotic D_max :", dict(zip(system_sizes, dmax_chaotic)))
-    print("Regular ceiling hit:", dict(zip(system_sizes, ceiling_reg)))
-    print("Chaotic ceiling hit:", dict(zip(system_sizes, ceiling_cha)))
-    if any(ceiling_reg) or any(ceiling_cha):
-        print(
-            "\nWARNING: at least one point still hit the depth ceiling "
-            f"(N + {CEILING_OFFSET}) even after raising it. Any such point "
-            "is a lower bound on D_max, not a converged value, and must be "
-            "reported/plotted as such -- do not present it as a "
-            "demonstrated D_max in the manuscript."
-        )
+    print("[VERIFY] Update the manuscript's depth-scaling discussion "
+          "(Sec. III J) with these D_max values. Chaotic should exceed "
+          "regular at each N; open markers are lower bounds.")
 
 
 if __name__ == "__main__":
