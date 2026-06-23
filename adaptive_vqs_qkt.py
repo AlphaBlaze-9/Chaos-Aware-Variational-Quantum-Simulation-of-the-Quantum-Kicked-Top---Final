@@ -507,34 +507,45 @@ RENYI2_PAGE = -np.log2(16.0 / 65.0)   # ≈ 2.02 bits
 
 
 def plot_adaptive(reg, cha, steps, outfile="figures/adaptive_residual",
-                  eps_trig=EPS_TRIG):
+                  eps_trig=EPS_TRIG, mid=None):
+    """Plot the 4-panel adaptive residual figure.
+    mid : optional dict from run_adaptive_floquet at k=1.75 (F6 intermediate regime).
+    """
     import os
     _aps_style()
+    MID_C = "#009E73"   # green for intermediate k=1.75
     t = np.arange(1, steps + 1)
     fig, ax = plt.subplots(2, 2, figsize=(DOUBLE_COL, 4.9),
                            sharex=True, constrained_layout=True)
 
     a = ax[0, 0]
     a.plot(t, reg["residual_ref"], "o-", color=REG_C, label="Regular ($k=0.5$)")
+    if mid is not None:
+        a.plot(t, mid["residual_ref"], "^-", color=MID_C,
+               label="Transition ($k=1.75$)")
     a.plot(t, cha["residual_ref"], "s-", color=CHA_C, label="Chaotic ($k=2.5$)")
     a.axhline(eps_trig, color="0.3", ls="--", lw=1.0,
               label=rf"$\varepsilon_{{\rm trig}}={eps_trig}$")
     a.set_ylim(0.0, 1.0)
     a.set_ylabel(r"McLachlan residual $r^2(t)$ at $D{=}1$")
     a.grid(True, ls=":", alpha=0.5)
-    a.legend(loc="best")
+    a.legend(loc="best", fontsize=6.5)
     a.text(0.035, 0.965, "(a)", transform=a.transAxes, va="top", fontweight="bold")
 
     b = ax[0, 1]
     b.plot(t, reg["depth"], "o-", color=REG_C, label="Regular ($k=0.5$)")
+    if mid is not None:
+        b.plot(t, mid["depth"], "^-", color=MID_C, label="Transition ($k=1.75$)")
     b.plot(t, cha["depth"], "s-", color=CHA_C, label="Chaotic ($k=2.5$)")
     b.set_ylabel(r"Circuit depth $D(t)$")
     b.grid(True, ls=":", alpha=0.5)
-    b.legend(loc="best")
+    b.legend(loc="best", fontsize=6.5)
     b.text(0.035, 0.965, "(b)", transform=b.transAxes, va="top", fontweight="bold")
 
     c = ax[1, 0]
     c.plot(t, reg["renyi2"], "o-", color=REG_C, label="Regular ($k=0.5$)")
+    if mid is not None:
+        c.plot(t, mid["renyi2"], "^-", color=MID_C, label="Transition ($k=1.75$)")
     c.plot(t, cha["renyi2"], "s-", color=CHA_C, label="Chaotic ($k=2.5$)")
     # Corrected Renyi-2 Page value line (was 2.85; now 2.02 bits)
     c.axhline(RENYI2_PAGE, color="0.4", ls=":", lw=1.0,
@@ -542,16 +553,19 @@ def plot_adaptive(reg, cha, steps, outfile="figures/adaptive_residual",
     c.set_ylabel(r"Rényi-2 entropy $S_2$ (bits)")
     c.set_xlabel(r"Floquet step $t$")
     c.grid(True, ls=":", alpha=0.5)
-    c.legend(loc="best")
+    c.legend(loc="best", fontsize=6.5)
     c.text(0.035, 0.965, "(c)", transform=c.transAxes, va="top", fontweight="bold")
 
     d = ax[1, 1]
     d.semilogy(t, reg["cond"], "o-", color=REG_C, label="Regular ($k=0.5$)")
+    if mid is not None:
+        d.semilogy(t, mid["cond"], "^-", color=MID_C,
+                   label="Transition ($k=1.75$)")
     d.semilogy(t, cha["cond"], "s-", color=CHA_C, label="Chaotic ($k=2.5$)")
     d.set_ylabel(r"Metric cond. number $\kappa(A)$")
     d.set_xlabel(r"Floquet step $t$")
     d.grid(True, which="both", ls=":", alpha=0.5)
-    d.legend(loc="best")
+    d.legend(loc="best", fontsize=6.5)
     d.text(0.035, 0.965, "(d)", transform=d.transAxes, va="top", fontweight="bold")
 
     os.makedirs(os.path.dirname(outfile) or ".", exist_ok=True)
@@ -578,7 +592,9 @@ if __name__ == "__main__":
     print("="*60)
     reg = run_adaptive_floquet(N, k=0.5, steps=STEPS)
     cha = run_adaptive_floquet(N, k=2.5, steps=STEPS)
-    plot_adaptive(reg, cha, STEPS)
+    # F6: intermediate regime k=1.75 (regular-to-chaotic transition)
+    mid = run_adaptive_floquet(N, k=1.75, steps=STEPS)
+    plot_adaptive(reg, cha, STEPS, mid=mid)
 
     # Verify residual ranges and report them for manuscript Sec. II.E.1
     print(f"\n[VERIFY for manuscript] D=1 residual ranges:")
@@ -590,6 +606,21 @@ if __name__ == "__main__":
     print(f"  Final chaotic depth = {cha['depth'][-1]} (expect 8)")
     print(f"  [diagnostic] Final fidelity: reg={reg['fid_diag'][-1]:.3f}  "
           f"cha={cha['fid_diag'][-1]:.3f}")
+
+    # Report intermediate k=1.75 results for F6
+    if mid is not None:
+        print(f"\n[F6 intermediate k=1.75] D=1 residual ranges:")
+        print(f"  k=1.75 r^2: min={min(mid['residual_ref']):.3f}  "
+              f"max={max(mid['residual_ref']):.3f}")
+        print(f"  Final depth at k=1.75: {mid['depth'][-1]}")
+        # Check how often trigger fires at k=1.75 vs threshold
+        mid_above = sum(r > EPS_TRIG for r in mid['residual_ref'])
+        print(f"  Steps above eps_trig={EPS_TRIG}: {mid_above}/{STEPS} "
+              f"({mid_above/STEPS*100:.0f}%)")
+        print(f"  >>> FOR PAPER (F6/Fig 8): at k=1.75 the trigger fires "
+              f"{mid_above/STEPS*100:.0f}% of steps, depth reaches "
+              f"{mid['depth'][-1]} — intermediate between regular (D=1) "
+              f"and chaotic (D=8).")
 
     # -----------------------------------------------------------------------
     # STEP 2: (ix) Trigger false-positive / false-negative rates

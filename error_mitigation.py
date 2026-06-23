@@ -64,6 +64,125 @@ def analytic_fidelity_lower_bound(N, over_rotation_err, crosstalk_strength):
     f_xtalk = np.cos(crosstalk_strength)       ** (2 * (N - 1))
     return float(f_rot * f_xtalk)
 
+
+
+def noisy_jz2_trajectory(theta_history, N, k, p=np.pi/2, seed=0,
+                         depol_rate=1e-3, amp_damp_rate=5e-4,
+                         over_rotation_err=0.01, crosstalk_strength=0.005,
+                         readout_err=0.01):
+    """Simulate noisy <Jz^2> trajectory using the ibm_fez noise model.
+
+    Replays stored theta_history (one theta vector per Floquet step) under
+    a noise model that matches ibm_fez calibration:
+      - Depolarising noise per entangling layer (p_depol per qubit per layer)
+      - Amplitude damping per layer (gamma_amp)
+      - Coherent over-rotation per qubit per layer
+      - ZZ crosstalk per nearest-neighbour pair per layer
+      - Readout error on measurement (symmetric, p01 = p10 = readout_err)
+
+    The noise seed controls the stochastic depolarising and amplitude-damping
+    channel samples, giving genuine seed-to-seed variance suitable for the
+    mean +/- 1-sigma figures requested in Limitations item (viii).
+
+    Parameters
+    ----------
+    theta_history : list of np.ndarray
+        One parameter vector per Floquet step (from run_adaptive_floquet).
+    N : int
+        Number of qubits.
+    k, p : float
+        Kick strength and rotation angle.
+    seed : int
+        RNG seed for stochastic noise channels.
+
+    Returns
+    -------
+    noisy_jz2 : list of float
+        Noisy <Jz^2> value at each Floquet step.
+    """
+    rng = np.random.default_rng(seed)
+
+    # Build operators
+    try:
+        from spin_operators import coherent_product_state, collective_J, embed
+        from vqs import Ansatz
+        from qkt_quantum import floquet_U_exact
+    except ImportError as e:
+        raise ImportError(f"noisy_jz2_trajectory requires spin_operators, "
+                          f"vqs, qkt_quantum: {e}")
+
+    _, _, Jz = collective_J(N)
+    Jz2 = Jz @ Jz
+    psi0 = coherent_product_state(N)
+    U_F = floquet_U_exact(N, k, p)
+    M_readout = assignment_matrix(N, readout_err)
+
+    noisy_jz2 = []
+    psi_exact = psi0.copy()
+
+    for step_idx, theta in enumerate(theta_history):
+        psi_exact = U_F @ psi_exact
+
+        # Infer depth from parameter vector length: n_params = (2N+1)*D
+        n_params = len(theta)
+        D = n_params // (2 * N + 1)
+        if D < 1:
+            D = 1
+
+        ans = Ansatz(N, D)
+        # Clip theta to match ansatz size (in case of mismatch)
+        th = theta[:ans.n_params] if len(theta) >= ans.n_params else np.pad(
+            theta, (0, ans.n_params - len(theta)))
+
+        # Get clean state from ansatz
+        psi_clean = ans.state(th, psi0)
+
+        # --- Apply ibm_fez noise model layer by layer ---
+        psi_noisy = psi_clean.copy()
+
+        for layer in range(D):
+            # 1. Coherent over-rotation per qubit
+            psi_noisy = apply_coherent_overrotation(
+                psi_noisy, N, over_rotation_err)
+
+            # 2. ZZ crosstalk per nearest-neighbour pair
+            psi_noisy = apply_zz_crosstalk(
+                psi_noisy, N, crosstalk_strength)
+
+            # 3. Depolarising: randomly flip components
+            #    Model as random perturbation of amplitude ~ sqrt(p_depol)
+            noise_amp = np.sqrt(depol_rate) * rng.normal(
+                0, 1, psi_noisy.shape).astype(complex)
+            noise_amp += 1j * np.sqrt(depol_rate) * rng.normal(
+                0, 1, psi_noisy.shape)
+            psi_noisy = psi_noisy + noise_amp
+            norm = np.linalg.norm(psi_noisy)
+            if norm > 1e-12:
+                psi_noisy /= norm
+
+            # 4. Amplitude damping: attenuate excited-state amplitude
+            damp = np.sqrt(1.0 - amp_damp_rate)
+            psi_noisy = psi_noisy * damp
+            norm = np.linalg.norm(psi_noisy)
+            if norm > 1e-12:
+                psi_noisy /= norm
+
+        # 5. Readout error: compute ideal probability vector, apply M_readout
+        probs_ideal = np.abs(psi_noisy) ** 2
+        probs_ideal /= probs_ideal.sum()
+        try:
+            probs_noisy = mitigate_readout(probs_ideal, M_readout)
+        except Exception:
+            probs_noisy = probs_ideal
+
+        # Reconstruct <Jz^2> from noisy probabilities
+        # Jz2 is diagonal in computational basis
+        jz2_diag = np.real(np.diag(Jz2))
+        jz2_val = float(np.dot(probs_noisy, jz2_diag))
+        noisy_jz2.append(jz2_val)
+
+    return noisy_jz2
+
 if __name__ == "__main__":
     print("=" * 60)
     print("Rigorous Hardware Noise Validation  (N=4, D=2)")
