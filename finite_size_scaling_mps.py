@@ -240,6 +240,23 @@ if __name__ == "__main__":
     print("STEP 1: Main MPS run at chi=256")
     print("="*60)
     results = run_all_and_plot(N_LIST, K_VALS, P_VAL, MAX_STEPS, chi=256)
+    # A4/A5 fix: print final-step S2 for every (N,k) so the caption can be
+    # made consistent. Check: (i) is the REGULAR N=12 curve really "near
+    # zero" at the final step? (ii) is the N=16 chaotic final-step value
+    # 1.4371, and is the volume-law ratio taken at the SAME final step?
+    print("\n>>> A4/A5 CHECK -- final-step S2 (use these to fix the caption):")
+    for (N, k) in sorted(results):
+        arr = results[(N, k)]
+        regime = "regular" if k == 0.5 else "chaotic"
+        print(f"    N={N:2d} {regime:7s} (k={k}): final S2 = {arr[-1]:.4f} "
+              f"(peak {max(arr):.4f})")
+    try:
+        r = results[(16,2.5)][-1] / results[(12,2.5)][-1]
+        print(f"    volume-law ratio at FINAL step: "
+              f"{results[(16,2.5)][-1]:.4f}/{results[(12,2.5)][-1]:.4f} "
+              f"= {r:.3f}  vs (16/2)/(12/2)=1.333")
+    except Exception:
+        pass
 
     # -----------------------------------------------------------------------
     # STEP 2: (xi) Bond-dimension convergence check at N=12 AND N=16

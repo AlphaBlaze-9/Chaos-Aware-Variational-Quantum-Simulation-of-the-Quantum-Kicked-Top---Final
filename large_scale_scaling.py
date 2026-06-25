@@ -154,9 +154,15 @@ def save_figure(system_sizes, mean_reg, std_reg, mean_cha, std_cha,
     ax.set_xlabel("System size $N$ (qubits)")
     ax.set_ylabel(r"Mean sufficient depth $\langle D\rangle_t$")
     ax.set_title("Mean circuit depth required vs. system size\n"
-                 "(direct optimization, averaged over Floquet steps)")
+                 "(direct optimization, averaged over Floquet steps)",
+                 pad=14)
     ax.set_xticks(ns_done)
     ax.grid(True, ls=":")
+    # A6 fix: add top headroom so the N=8 "(lower bound)" annotation
+    # cannot collide with the two-line title.
+    _all_vals = list(mean_reg[:len(ns_done)]) + list(mean_cha)
+    _ymax = max(_all_vals) if _all_vals else 6.0
+    ax.set_ylim(0, _ymax + 2.0)
 
     # ── Per-point annotations ──────────────────────────────────────────────
     # N=8 annotation is ALWAYS added (this was the open task: "PNG edit
@@ -171,8 +177,10 @@ def save_figure(system_sizes, mean_reg, std_reg, mean_cha, std_cha,
             step_str = f"({n_eval}-step t-avg)"
 
         m  = mean_cha[i]
-        xoff = -0.55 if n >= 8 else 0.2
-        yoff = +0.5
+        # A6 fix: drop the label below-left of the point so it never
+        # overlaps the title at the top of the axes.
+        xoff = -0.85 if n >= 8 else 0.2
+        yoff = -1.4 if n >= 8 else +0.5
 
         ax.annotate(
             f"$N={n}$\n{step_str}",

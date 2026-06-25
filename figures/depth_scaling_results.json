@@ -1,0 +1,65 @@
+{
+  "system_sizes": [
+    4,
+    6,
+    8,
+    10
+  ],
+  "chaotic": {
+    "mean_depth": [
+      2.4,
+      3.5,
+      6.0,
+      16.0
+    ],
+    "std_depth": [
+      0.699,
+      0.707,
+      0.0,
+      0.0
+    ],
+    "max_depth": [
+      3,
+      4,
+      6,
+      16
+    ],
+    "n_steps_evaluated": [
+      10,
+      2,
+      1,
+      1
+    ]
+  },
+  "regular": {
+    "mean_depth": [
+      1.7,
+      1.833,
+      3.4,
+      4.75
+    ],
+    "std_depth": [
+      0.675,
+      0.983,
+      3.912,
+      7.5
+    ],
+    "max_depth": [
+      3,
+      3,
+      10,
+      16
+    ],
+    "n_steps_evaluated": [
+      10,
+      6,
+      5,
+      4
+    ]
+  },
+  "eps_opt": 0.05,
+  "k_chaotic": 2.5,
+  "k_regular": 0.5,
+  "n_restarts": 12,
+  "n_steps_max": 10
+}

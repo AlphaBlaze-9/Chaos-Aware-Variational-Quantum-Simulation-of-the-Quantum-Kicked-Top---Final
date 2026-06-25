@@ -590,10 +590,16 @@ if __name__ == "__main__":
     print("\n" + "="*60)
     print("STEP 1: Main adaptive run (Euler dt=1/15, the original result)")
     print("="*60)
-    reg = run_adaptive_floquet(N, k=0.5, steps=STEPS)
-    cha = run_adaptive_floquet(N, k=2.5, steps=STEPS)
+    # A1 (optional): use_rk4=True regenerates Fig. 8 with the converged
+    # integrator. Fig. 8 is a DIAGNOSTIC figure (residual + depth growth),
+    # so its message is robust to the integrator choice, but RK4 removes the
+    # "unconverged" caveat. If you regenerate, RE-VERIFY the D=1 residual
+    # ranges printed below and update them in the manuscript text.
+    USE_RK4 = True
+    reg = run_adaptive_floquet(N, k=0.5, steps=STEPS, use_rk4=USE_RK4)
+    cha = run_adaptive_floquet(N, k=2.5, steps=STEPS, use_rk4=USE_RK4)
     # F6: intermediate regime k=1.75 (regular-to-chaotic transition)
-    mid = run_adaptive_floquet(N, k=1.75, steps=STEPS)
+    mid = run_adaptive_floquet(N, k=1.75, steps=STEPS, use_rk4=USE_RK4)
     plot_adaptive(reg, cha, STEPS, mid=mid)
 
     # Verify residual ranges and report them for manuscript Sec. II.E.1
