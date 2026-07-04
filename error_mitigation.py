@@ -170,10 +170,11 @@ def noisy_jz2_trajectory(theta_history, N, k, p=np.pi/2, seed=0,
         # 5. Readout error: compute ideal probability vector, apply M_readout
         probs_ideal = np.abs(psi_noisy) ** 2
         probs_ideal /= probs_ideal.sum()
-        try:
-            probs_noisy = mitigate_readout(probs_ideal, M_readout)
-        except Exception:
-            probs_noisy = probs_ideal
+        probs_noisy = M_readout @ probs_ideal
+        probs_noisy = np.clip(probs_noisy, 0.0, None)
+        s = probs_noisy.sum()
+        if s > 0:
+            probs_noisy /= s
 
         # Reconstruct <Jz^2> from noisy probabilities
         # Jz2 is diagonal in computational basis
