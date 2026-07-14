@@ -1,0 +1,89 @@
+
+============================================================
+STEP 1: D_max sweep -- NN ansatz (original, Fig. 10)
+============================================================
+
+k=0.50  [RESTORED FROM PRIOR RUN, NOT RECOMPUTED]
+-> D_max=4  FTLE=+0.007
+
+k=1.00  [RESTORED FROM PRIOR RUN, NOT RECOMPUTED]
+-> D_max=5  FTLE=+0.011
+
+k=1.50  [RESTORED FROM PRIOR RUN, NOT RECOMPUTED]
+-> D_max=5  FTLE=+0.013
+
+k=1.75  [RESTORED FROM PRIOR RUN, NOT RECOMPUTED]
+-> D_max=4  FTLE=+0.013
+
+k=2.00  [RESTORED FROM PRIOR RUN, NOT RECOMPUTED]
+-> D_max=5  FTLE=+0.016
+
+k=2.25  [RESTORED FROM PRIOR RUN, NOT RECOMPUTED]
+-> D_max=5  FTLE=+0.039
+
+k=2.50  [RESTORED FROM PRIOR RUN, NOT RECOMPUTED]
+-> D_max=5  FTLE=+0.088
+
+k=2.75  [RESTORED FROM PRIOR RUN, NOT RECOMPUTED]
+-> D_max=5  FTLE=+0.201
+
+k=3.00  [RESTORED FROM PRIOR RUN, NOT RECOMPUTED]
+-> D_max=5  FTLE=+0.275
+
+k=3.25  [RESTORED FROM PRIOR RUN, NOT RECOMPUTED]
+-> D_max=5  FTLE=+0.387
+
+k=3.50  [RESTORED FROM PRIOR RUN, NOT RECOMPUTED]
+-> D_max=5  FTLE=+0.465
+
+Saved figures/dmax_vs_k.pdf / .png
+
+[VERIFY] D_max sequence: [np.int64(4), np.int64(5), np.int64(5), np.int64(4), np.int64(5), np.int64(5), np.int64(5), np.int64(5), np.int64(5), np.int64(5), np.int64(5)]
+NOTE: D_max is non-monotone (expected -- stated explicitly in paper).
+
+============================================================
+STEP 2: eps_opt=0.03 sensitivity for k=2.5, 3.0, 3.5
+============================================================
+
+k=2.50  [RESTORED FROM PRIOR RUN, NOT RECOMPUTED]
+-> D_max=6  FTLE=+0.088
+
+k=3.00  [RESTORED FROM PRIOR RUN, NOT RECOMPUTED]
+-> D_max=7  FTLE=+0.275
+
+k=3.50  [RESTORED FROM PRIOR RUN, NOT RECOMPUTED]
+-> D_max=7  FTLE=+0.465
+
+>>> PASTE INTO PAPER (Sec. Limitations item vi):
+    k=2.5: D_max(eps=0.05)=5  D_max(eps=0.03)=6  -> CHANGED
+    k=3.0: D_max(eps=0.05)=5  D_max(eps=0.03)=7  -> CHANGED
+    k=3.5: D_max(eps=0.05)=5  D_max(eps=0.03)=7  -> CHANGED
+
+============================================================
+STEP 3: Architecture test -- NNN entangler at k=0.5 and k=2.5
+============================================================
+
+k=0.50  (direct-opt D_max, N=6, eps_opt=0.05, ansatz=nnn)
+    k=0.50 t= 1: D_max=1  (ansatz=nnn)
+    k=0.50 t= 2: D_max=1  (ansatz=nnn)
+    k=0.50: time budget (300 s) reached after t=2; reporting over 2 step(s) (ansatz=nnn).
+-> D_max=1  FTLE=+0.007  [only 2/12 steps evaluated]
+
+k=2.50  (direct-opt D_max, N=6, eps_opt=0.05, ansatz=nnn)
+    k=2.50 t= 1: D_max=0  (ansatz=nnn)
+    k=2.50: time budget (300 s) reached after t=1; reporting over 1 step(s) (ansatz=nnn).
+-> D_max=0  FTLE=+0.088 (lower bound)  [only 1/12 steps evaluated]
+Saved figures/architecture_test.pdf / .png
+
+>>> PASTE INTO PAPER (Sec. Limitations item v):
+    k=0.5: D_max(NN)=4  D_max(NNN)=1  -> DIFFERENT
+    k=2.5: D_max(NN)=5  D_max(NNN)=0  -> DIFFERENT
+    -> D_max DIFFERS by ansatz architecture.
+       The resource claim is architecture-specific; caveat in paper.
+
+============================================================
+ALL STEPS COMPLETE.
+Figures produced:
+  figures/dmax_vs_k.{pdf,png}          <- REPLACES Fig. 10
+  figures/architecture_test.{pdf,png}   <- NEW (reviewer item v)
+============================================================

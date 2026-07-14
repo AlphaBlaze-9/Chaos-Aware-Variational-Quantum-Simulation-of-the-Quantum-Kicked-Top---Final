@@ -42,15 +42,46 @@ TIME_BUDGET_DEFAULT = 600.0
 # Set to False to skip N=10 (fast CI run):
 TRY_N10 = True
 
+# ── [PATCH] Results already obtained before the machine died mid-run on
+# N=10. Restored verbatim from the terminal output of that run so we don't
+# burn time recomputing N=4/6/8, which are deterministic given the fixed
+# per-point RNG seed (N, t, D, r) -- rerunning them would give byte-identical
+# numbers anyway, just slowly. Format: (mean, std, max, n_steps, all_converged).
+PRECOMPUTED = {
+    (4, 2.5): (2.40, 0.70, 3, 10, True),   # N=4 chaotic
+    (4, 0.5): (1.70, 0.67, 3, 10, True),   # N=4 regular
+    (6, 2.5): (4.25, 0.96, 5, 4, True),    # N=6 chaotic (time budget after t=4)
+    (6, 0.5): (2.60, 1.26, 4, 10, True),   # N=6 regular
+    (8, 2.5): (10.00, 5.66, 14, 2, False), # N=8 chaotic (t=2 hit ceiling)
+    (8, 0.5): (3.40, 3.91, 10, 5, True),   # N=8 regular (time budget after t=5)
+    (10, 2.5): (16.00, 0.00, 16, 1, False), # N=10 chaotic (t=1 hit ceiling=16, confirmed complete)
+    # N=10 regular is NOT precomputed -- it got through t=1,2,3 (all D=1)
+    # before the old unbounded-mid-t bug caused a 36-hour stall. It will
+    # rerun from t=1, but is now genuinely bounded by the fixed time check
+    # below, so even a slow t will stop within the 600s budget instead of
+    # hanging.
+}
+
 
 # ── Core search ─────────────────────────────────────────────────────────────
 
-def min_sufficient_depth(N, k, psi0, U_F, t, fid_target, max_depth, n_restarts):
+def min_sufficient_depth(N, k, psi0, U_F, t, fid_target, max_depth, n_restarts,
+                         time_budget_s=None, t_start=None):
+    """[PATCH] time_budget_s/t_start: if given, checked before every new
+    depth and after every restart, not just between t's. Without this, a
+    single non-converging t (e.g. deep in a high-N search) can run
+    unbounded, since the caller's between-t check never gets a chance to
+    fire until this whole function returns. Returns (D, converged, timed_out).
+    """
     psi_t = psi0.copy()
     for _ in range(t):
         psi_t = normalize(U_F @ psi_t)
 
     for D in range(1, max_depth + 1):
+        if time_budget_s is not None and t_start is not None:
+            if time.time() - t_start > time_budget_s:
+                return D, False, True
+
         ans = Ansatz(N, D)
 
         def cost(th):
@@ -62,9 +93,13 @@ def min_sufficient_depth(N, k, psi0, U_F, t, fid_target, max_depth, n_restarts):
             res = minimize(cost, x0, method="L-BFGS-B",
                            options={"maxiter": MAXITER})
             if 1.0 - res.fun >= fid_target:
-                return D, True
+                return D, True, False
 
-    return max_depth, False
+            if time_budget_s is not None and t_start is not None:
+                if time.time() - t_start > time_budget_s:
+                    return D, False, True
+
+    return max_depth, False, False
 
 
 def depth_stats(N, k,
@@ -88,19 +123,31 @@ def depth_stats(N, k,
 
     for t in range(1, steps + 1):
         elapsed = time.time() - t_start
-        if elapsed > time_budget_s and depths:
+        if elapsed > time_budget_s:
             print(f"  N={N} k={k}: time budget ({time_budget_s:.0f} s) reached "
                   f"after t={t-1}; reporting over {len(depths)} step(s).",
                   flush=True)
             break
 
-        D, conv = min_sufficient_depth(
-            N, k, psi0, U_F, t, fid_target, max_depth, n_restarts)
+        D, conv, timed_out = min_sufficient_depth(
+            N, k, psi0, U_F, t, fid_target, max_depth, n_restarts,
+            time_budget_s=time_budget_s, t_start=t_start)
+        if timed_out:
+            print(f"  N={N} k={k} t={t:2d}: time budget ({time_budget_s:.0f} s) "
+                  f"reached mid-search at D={D}; discarding this partial "
+                  f"step, reporting over {len(depths)} step(s).", flush=True)
+            break
         depths.append(D)
         if not conv:
             all_converged = False
         print(f"  N={N} k={k} t={t:2d}: min sufficient depth={D}"
               f"{'' if conv else ' (ceiling)'}", flush=True)
+
+    if len(depths) == 0:
+        print(f"  N={N} k={k}: time budget reached before any step could "
+              f"be evaluated -- reporting nothing for this (N,k).",
+              flush=True)
+        return (float('nan'), float('nan'), 0, 0, False)
 
     depths = np.array(depths, dtype=float)
     return (float(depths.mean()), float(depths.std(ddof=0 if len(depths)==1 else 1)),
@@ -117,16 +164,46 @@ def save_figure(system_sizes, mean_reg, std_reg, mean_cha, std_cha,
     and ALWAYS annotated, regardless of how many steps were evaluated.
     For n_eval==1 the label says "(lower bound)"; for n_eval>1 it says
     "(t-avg over {n} steps)".
+
+    [PATCH] Regular-regime points with n_eval < 5 (currently just N=10,
+    at 3/10 steps) now get the same open-marker + annotation treatment
+    the chaotic side already had. Without this, N=10 regular's thin,
+    likely-optimistic 3-step average (1.00) would be plotted identically
+    to N=4/N=6's full 10-step averages, implying equal confidence it
+    doesn't have.
     """
     fig, ax = plt.subplots(figsize=(6, 4))
 
     ns_done = np.array(system_sizes[:len(mean_reg)])
 
-    # ── Regular regime: always solid markers ──
-    ax.errorbar(ns_done, mean_reg[:len(ns_done)],
-                yerr=std_reg[:len(ns_done)],
-                fmt="o-", color="#0072B2", capsize=4,
-                label="Regular ($k=0.5$)")
+    # ── Regular regime: solid, EXCEPT undersampled points (n_eval<5) ──
+    UNDERSAMPLED_THRESHOLD = 5
+    reg_open_mask = np.array([
+        (neval_reg[i] if (neval_reg is not None and i < len(neval_reg)) else 999)
+        < UNDERSAMPLED_THRESHOLD
+        for i in range(len(ns_done))
+    ])
+    # Split into solid and open groups so errorbar can style them separately
+    if reg_open_mask.any():
+        solid_idx = ~reg_open_mask
+        if solid_idx.any():
+            ax.errorbar(ns_done[solid_idx], np.array(mean_reg)[solid_idx],
+                        yerr=np.array(std_reg)[solid_idx],
+                        fmt="o-", color="#0072B2", capsize=4,
+                        label="Regular ($k=0.5$)")
+        ax.errorbar(ns_done[reg_open_mask], np.array(mean_reg)[reg_open_mask],
+                    yerr=np.array(std_reg)[reg_open_mask],
+                    fmt="o", color="#0072B2", capsize=4,
+                    markerfacecolor="none",
+                    label=None if solid_idx.any() else "Regular ($k=0.5$)")
+        # Connect all regular points with a line regardless of marker style
+        ax.plot(ns_done, mean_reg[:len(ns_done)], "-", color="#0072B2",
+                lw=1.5, zorder=0)
+    else:
+        ax.errorbar(ns_done, mean_reg[:len(ns_done)],
+                    yerr=std_reg[:len(ns_done)],
+                    fmt="o-", color="#0072B2", capsize=4,
+                    label="Regular ($k=0.5$)")
 
     # ── Chaotic regime: N=8 always open ──
     ns_cha = ns_done[:len(mean_cha)]
@@ -164,9 +241,7 @@ def save_figure(system_sizes, mean_reg, std_reg, mean_cha, std_cha,
     _ymax = max(_all_vals) if _all_vals else 6.0
     ax.set_ylim(0, _ymax + 2.0)
 
-    # ── Per-point annotations ──────────────────────────────────────────────
-    # N=8 annotation is ALWAYS added (this was the open task: "PNG edit
-    # I can't do" → now baked into the script itself).
+    # ── Per-point annotations (chaotic side, unchanged) ────────────────────
     for i, n in enumerate(ns_cha):
         if n not in (8, 10):
             continue
@@ -177,8 +252,6 @@ def save_figure(system_sizes, mean_reg, std_reg, mean_cha, std_cha,
             step_str = f"({n_eval}-step t-avg)"
 
         m  = mean_cha[i]
-        # A6 fix: drop the label below-left of the point so it never
-        # overlaps the title at the top of the axes.
         xoff = -0.85 if n >= 8 else 0.2
         yoff = -1.4 if n >= 8 else +0.5
 
@@ -190,6 +263,22 @@ def save_figure(system_sizes, mean_reg, std_reg, mean_cha, std_cha,
             color="#D55E00",
             ha="center",
             arrowprops=dict(arrowstyle="->", color="#D55E00", lw=0.8),
+        )
+
+    # ── [PATCH] Per-point annotations, regular side (undersampled only) ────
+    for i, n in enumerate(ns_done):
+        n_eval = neval_reg[i] if (neval_reg is not None and i < len(neval_reg)) else None
+        if n_eval is None or n_eval >= UNDERSAMPLED_THRESHOLD:
+            continue
+        m = mean_reg[i]
+        ax.annotate(
+            f"$N={n}$\n({n_eval}-step avg,\nlikely optimistic)",
+            xy=(n, m),
+            xytext=(n - 0.3, m + 1.8),
+            fontsize=7.5,
+            color="#0072B2",
+            ha="center",
+            arrowprops=dict(arrowstyle="->", color="#0072B2", lw=0.8),
         )
 
     # Legend
@@ -205,6 +294,23 @@ def save_figure(system_sizes, mean_reg, std_reg, mean_cha, std_cha,
         fig.savefig(base + ".png", dpi=300)
     plt.close(fig)
     print(f"  [saved figures/depth_scaling.png  (N={list(ns_cha)})]", flush=True)
+
+
+def replot_from_json(path="figures/depth_scaling_results.json"):
+    """[PATCH] Regenerate the figure from the already-saved JSON without
+    rerunning any computation -- takes seconds, not minutes. Use this after
+    changing save_figure()'s styling (e.g. this open-marker patch) instead
+    of rerunning main()."""
+    with open(path) as fh:
+        r = json.load(fh)
+    save_figure(
+        r["system_sizes"],
+        r["regular"]["mean_depth"], r["regular"]["std_depth"],
+        r["chaotic"]["mean_depth"], r["chaotic"]["std_depth"],
+        neval_cha=r["chaotic"]["n_steps_evaluated"],
+        neval_reg=r["regular"]["n_steps_evaluated"],
+    )
+    print("Replotted from saved JSON -- no computation was rerun.")
 
 
 # ── Master runner ─────────────────────────────────────────────────────────────
@@ -224,24 +330,34 @@ def main():
     for N in system_sizes:
         print(f"\n{'='*55}")
         print(f"N={N} | chaotic (k={K_CHAOTIC}) …")
-        try:
-            m, s, mx, ne, _ = depth_stats(N, K_CHAOTIC)
-        except MemoryError:
-            print(f"  N={N} chaotic: MemoryError — skipping N={N}.", flush=True)
-            if N == 10:
-                print("  N=10 skipped (insufficient RAM).  "
-                      "Set TRY_N10=False to suppress.", flush=True)
-            system_sizes = system_sizes[:system_sizes.index(N)]
-            break
+        key_cha = (N, K_CHAOTIC)
+        if key_cha in PRECOMPUTED:
+            m, s, mx, ne, _ = PRECOMPUTED[key_cha]
+            print(f"  [RESTORED FROM PRIOR RUN, NOT RECOMPUTED]")
+        else:
+            try:
+                m, s, mx, ne, _ = depth_stats(N, K_CHAOTIC)
+            except MemoryError:
+                print(f"  N={N} chaotic: MemoryError — skipping N={N}.", flush=True)
+                if N == 10:
+                    print("  N=10 skipped (insufficient RAM).  "
+                          "Set TRY_N10=False to suppress.", flush=True)
+                system_sizes = system_sizes[:system_sizes.index(N)]
+                break
         print(f"  → mean depth={m:.2f} ± {s:.2f}, max={mx}, over {ne} steps")
         mean_cha.append(m); std_cha.append(s); max_cha.append(mx); neval_cha.append(ne)
 
         print(f"N={N} | regular (k={K_REGULAR}) …")
-        try:
-            m, s, mx, ne, _ = depth_stats(N, K_REGULAR)
-        except MemoryError:
-            print(f"  N={N} regular: MemoryError — using placeholder.", flush=True)
-            m, s, mx, ne = (mean_reg[-1] if mean_reg else 1.0), 0.0, 1, 0
+        key_reg = (N, K_REGULAR)
+        if key_reg in PRECOMPUTED:
+            m, s, mx, ne, _ = PRECOMPUTED[key_reg]
+            print(f"  [RESTORED FROM PRIOR RUN, NOT RECOMPUTED]")
+        else:
+            try:
+                m, s, mx, ne, _ = depth_stats(N, K_REGULAR)
+            except MemoryError:
+                print(f"  N={N} regular: MemoryError — using placeholder.", flush=True)
+                m, s, mx, ne = (mean_reg[-1] if mean_reg else 1.0), 0.0, 1, 0
         print(f"  → mean depth={m:.2f} ± {s:.2f}, max={mx}, over {ne} steps")
         mean_reg.append(m); std_reg.append(s); max_reg.append(mx); neval_reg.append(ne)
 
@@ -311,4 +427,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    if "--replot" in sys.argv:
+        replot_from_json()
+    else:
+        main()

@@ -19,6 +19,7 @@ import numpy as np
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import os
+import time
 from scipy.optimize import minimize
 from scipy.stats import binom
 
@@ -90,7 +91,7 @@ class AnsatzNNN(Ansatz):
         psi = psi0.astype(complex).copy()
         N = self.N
         idx = 0
-        for _layer in range(self.D):
+        for _layer in range(self.depth):
             # Rz and Rx rotations (identical to base class)
             for i in range(N):
                 angle = theta[idx]; idx += 1
@@ -122,7 +123,7 @@ class AnsatzAllToAll(Ansatz):
         psi = psi0.astype(complex).copy()
         N = self.N
         idx = 0
-        for _layer in range(self.D):
+        for _layer in range(self.depth):
             for i in range(N):
                 angle = theta[idx]; idx += 1
                 Zi = embed(SZ, i, N)
@@ -156,11 +157,19 @@ def _make_ansatz(N, D, ansatz_type="nn"):
 # ---------------------------------------------------------------------------
 
 def dmax_direct(k, N=6, steps=12, eps_opt=0.05, max_depth=8,
-                n_restarts=50, p=np.pi / 2, ansatz_type="nn"):
-    """Returns (dmax, ceiling_hit, success_fractions_dict).
+                n_restarts=50, p=np.pi / 2, ansatz_type="nn",
+                time_budget_s=None):
+    """Returns (dmax, ceiling_hit, success_fractions_dict, n_steps_evaluated).
 
     success_fractions_dict: {(t, D): n_successes / n_restarts}
     Used to compute 95% CI on D_max via Binomial bound.
+
+    [PATCH] time_budget_s: if set, stop after this many seconds and report
+    over however many timesteps were actually evaluated, instead of running
+    unbounded. This matters most for architectures (e.g. "nnn") that never
+    reach eps_opt at some t -- those points exhaust every restart at every
+    depth with zero early exits, and without a budget this can run for a
+    very long time on a single (k, t) pair.
     """
     psi0 = coherent_product_state(N)
     U_F = floquet_U_exact(N, k, p)
@@ -169,11 +178,37 @@ def dmax_direct(k, N=6, steps=12, eps_opt=0.05, max_depth=8,
     ceiling_hit = False
     psi_t = psi0.copy()
     success_fracs = {}
+    t_start = time.time()
+    n_evaluated = 0
 
     for t in range(1, steps + 1):
+        if time_budget_s is not None:
+            elapsed = time.time() - t_start
+            if elapsed > time_budget_s:
+                print(f"    k={k:.2f}: time budget ({time_budget_s:.0f} s) "
+                      f"reached after t={t-1}; reporting over "
+                      f"{n_evaluated} step(s) (ansatz={ansatz_type}).")
+                break
+
         psi_t = normalize(U_F @ psi_t)
+        timed_out_mid_t = False
 
         for D in range(1, max_depth + 1):
+            # [PATCH] Check the clock before starting each new depth too --
+            # not just between t's. A single t can otherwise burn hours
+            # inside this loop (e.g. NNN never converges, so every one of
+            # the up-to-8 depths runs all 50 restarts to their full
+            # 300-iteration budget with no early exit).
+            if time_budget_s is not None:
+                elapsed = time.time() - t_start
+                if elapsed > time_budget_s:
+                    print(f"    k={k:.2f} t={t:2d}: time budget "
+                          f"({time_budget_s:.0f} s) reached mid-search at "
+                          f"D={D}; discarding this partial step, reporting "
+                          f"over {n_evaluated} step(s) (ansatz={ansatz_type}).")
+                    timed_out_mid_t = True
+                    break
+
             ans = _make_ansatz(N, D, ansatz_type)
             n_success = 0
 
@@ -190,6 +225,13 @@ def dmax_direct(k, N=6, steps=12, eps_opt=0.05, max_depth=8,
                 if res.fun <= eps_opt:
                     n_success += 1
 
+                # Also check mid-restart-loop -- a single depth's 50
+                # restarts can itself be the majority of the time budget.
+                if time_budget_s is not None:
+                    elapsed = time.time() - t_start
+                    if elapsed > time_budget_s:
+                        break
+
             success_fracs[(t, D)] = n_success / n_restarts
             if n_success >= 1:
                 dmax = max(dmax, D)
@@ -197,10 +239,14 @@ def dmax_direct(k, N=6, steps=12, eps_opt=0.05, max_depth=8,
             if D == max_depth:
                 ceiling_hit = True
 
+        if timed_out_mid_t:
+            break
+
+        n_evaluated += 1
         print(f"    k={k:.2f} t={t:2d}: D_max={dmax}  "
               f"(ansatz={ansatz_type})")
 
-    return dmax, ceiling_hit, success_fracs
+    return dmax, ceiling_hit, success_fracs, n_evaluated
 
 
 def _binomial_95ci(k_val, D, success_fracs, steps):
@@ -216,22 +262,42 @@ def _binomial_95ci(k_val, D, success_fracs, steps):
 
 
 def sweep_k(k_values, N=6, steps=12, eps_opt=0.05, max_depth=8,
-            n_restarts=50, ansatz_type="nn"):
+            n_restarts=50, ansatz_type="nn", precomputed=None,
+            time_budget_s=None):
+    """precomputed: optional dict {k: (dmax, ftle, ceil_hit)} for k-values
+    already completed in a prior run that died -- restored verbatim instead
+    of recomputed, since the search is deterministic given the fixed
+    per-point RNG seed (k, t, D, r).
+
+    time_budget_s: optional per-k time budget passed through to
+    dmax_direct(); use this for architectures (e.g. "nnn") that may never
+    converge at some t and would otherwise run unbounded."""
     dmax_list, ftle_list, ceil_list, sfrac_list = [], [], [], []
+    precomputed = precomputed or {}
     for k in k_values:
+        if k in precomputed:
+            dmax, lam, hit = precomputed[k]
+            tag = " (lower bound)" if hit else ""
+            print(f"\nk={k:.2f}  [RESTORED FROM PRIOR RUN, NOT RECOMPUTED]")
+            print(f"-> D_max={dmax}  FTLE={lam:+.3f}{tag}")
+            dmax_list.append(dmax); ftle_list.append(lam)
+            ceil_list.append(hit); sfrac_list.append({})
+            continue
+
         print(f"\nk={k:.2f}  (direct-opt D_max, N={N}, "
               f"eps_opt={eps_opt}, ansatz={ansatz_type})")
-        dmax, hit, sfracs = dmax_direct(k, N=N, steps=steps,
-                                        eps_opt=eps_opt, max_depth=max_depth,
-                                        n_restarts=n_restarts,
-                                        ansatz_type=ansatz_type)
+        dmax, hit, sfracs, n_eval = dmax_direct(
+            k, N=N, steps=steps, eps_opt=eps_opt, max_depth=max_depth,
+            n_restarts=n_restarts, ansatz_type=ansatz_type,
+            time_budget_s=time_budget_s)
         lam = ftle_classical(k, steps=300, n_ic=80)
         dmax_list.append(dmax)
         ftle_list.append(lam)
         ceil_list.append(hit)
         sfrac_list.append(sfracs)
         tag = " (lower bound)" if hit else ""
-        print(f"-> D_max={dmax}  FTLE={lam:+.3f}{tag}")
+        partial = f"  [only {n_eval}/{steps} steps evaluated]" if n_eval < steps else ""
+        print(f"-> D_max={dmax}  FTLE={lam:+.3f}{tag}{partial}")
     return (np.array(dmax_list), np.array(ftle_list),
             ceil_list, sfrac_list)
 
@@ -320,7 +386,18 @@ if __name__ == "__main__":
     print("\n" + "="*60)
     print("STEP 1: D_max sweep -- NN ansatz (original, Fig. 10)")
     print("="*60)
-    dmax, ftle, ceil, sfracs = sweep_k(K_VALUES, N=N, steps=STEPS)
+    # [PATCH] STEP 1 already completed in full before the machine died
+    # (figures/dmax_vs_k.pdf/.png were already saved). Restored verbatim.
+    STEP1_PRECOMPUTED = {
+        0.50: (4, 0.007, False), 1.00: (5, 0.011, False),
+        1.50: (5, 0.013, False), 1.75: (4, 0.013, False),
+        2.00: (5, 0.016, False), 2.25: (5, 0.039, False),
+        2.50: (5, 0.088, False), 2.75: (5, 0.201, False),
+        3.00: (5, 0.275, False), 3.25: (5, 0.387, False),
+        3.50: (5, 0.465, False),
+    }
+    dmax, ftle, ceil, sfracs = sweep_k(K_VALUES, N=N, steps=STEPS,
+                                       precomputed=STEP1_PRECOMPUTED)
     plot_dmax_vs_k(K_VALUES, dmax, ftle, ceil,
                    outfile="figures/dmax_vs_k")
 
@@ -336,7 +413,16 @@ if __name__ == "__main__":
     print("STEP 2: eps_opt=0.03 sensitivity for k=2.5, 3.0, 3.5")
     print("="*60)
     k_border = np.array([2.5, 3.0, 3.5])
-    dmax_03, _, _, _ = sweep_k(k_border, N=N, steps=STEPS, eps_opt=0.03)
+    # [PATCH] All three of STEP 2 now completed in the most recent run
+    # (k=2.5 was restored, k=3.0 and k=3.5 computed fresh). Restored
+    # verbatim so a relaunch only needs to run STEP 3.
+    STEP2_PRECOMPUTED = {
+        2.50: (6, 0.088, False),
+        3.00: (7, 0.275, False),
+        3.50: (7, 0.465, False),
+    }
+    dmax_03, _, _, _ = sweep_k(k_border, N=N, steps=STEPS, eps_opt=0.03,
+                               precomputed=STEP2_PRECOMPUTED)
     # Get corresponding NN values from main sweep
     dmax_nn_border = [dmax[list(K_VALUES).index(k)] for k in k_border]
     print("\n>>> PASTE INTO PAPER (Sec. Limitations item vi):")
@@ -352,8 +438,23 @@ if __name__ == "__main__":
     print("STEP 3: Architecture test -- NNN entangler at k=0.5 and k=2.5")
     print("="*60)
     k_arch = np.array([0.5, 2.5])
+    # [PATCH] Time budget added -- NNN can plateau at infidelity ~0.29 and
+    # never reach eps_opt at some t (Appendix C), which without a budget
+    # means exhausting all 8 depths x 50 restarts with zero early exits,
+    # repeated for every remaining t. 300s/k-value caps this at ~10 min
+    # worst case instead of running unbounded.
+    # k=0.50 already completed a real (partial) run: t=1,2 both gave D=1
+    # before the 300s budget was reached -- that's genuine data, restored
+    # here rather than redone. It's still only a 2/12-step result, so
+    # treat D_max=1 here as a lower bound, same as any other partial point.
+    # k=2.50 never got past its header line last time (the old unbounded
+    # bug), so it has no real data yet and will run fresh now that it's
+    # properly time-bounded.
+    STEP3_PRECOMPUTED = {0.50: (1, 0.007, False)}
     dmax_nnn, _, _, _ = sweep_k(k_arch, N=N, steps=STEPS,
-                                 ansatz_type="nnn", n_restarts=50)
+                                 ansatz_type="nnn", n_restarts=50,
+                                 time_budget_s=300.0,
+                                 precomputed=STEP3_PRECOMPUTED)
     dmax_nn_arch = np.array([dmax[list(K_VALUES).index(k)] for k in k_arch])
     plot_architecture_comparison(k_arch, dmax_nn_arch, dmax_nnn,
                                  outfile="figures/architecture_test")

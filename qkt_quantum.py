@@ -1,5 +1,5 @@
 """
-qkt_quantum.py  --  Floquet operator and related quantum machinery.
+qkt_quantum.py -- Floquet operator and related quantum machinery.
 
 CHANGES FROM ORIGINAL:
   Appendix A / reviewer items (P7, C6):
@@ -10,16 +10,21 @@ CHANGES FROM ORIGINAL:
       reports the fraction of operator norm from YZ vs ZZ interactions.
       Used to assess the ADAPT-VQA operator-pool confound (reviewer item
       xii) and to support the J_z^2 all-to-all ZZ content claim.
-  
+
   All existing functions are UNCHANGED.
+
+  [PATCH] Added `floquet_U` as a backward-compatible alias for
+  `floquet_U_exact`, since otoc.py, loschmidt.py, and main.py all still
+  import the old name.
 """
+
 import numpy as np
 from functools import reduce
 from scipy.linalg import logm as scipy_logm
+
 from spin_operators import (
     collective_J, embed, SZ, expm_unitary, spin_coherent_state, normalize,
 )
-
 
 # ---------------------------------------------------------------------------
 # Core QKT operators (unchanged)
@@ -106,19 +111,18 @@ def branch_validity_check(N: int, k_values=None, p: float = np.pi / 2,
     and that e^{-i H_eff} reproduces U_F element-wise.
 
     Returns dict with:
-      "min_spectral_gap" : array of min|arg(lambda) - pi| for each k
-      "max_element_error": array of max|e^{-iH_eff} - U_F| for each k
+      "min_spectral_gap"  : array of min|arg(lambda) - pi| for each k
+      "max_element_error" : array of max|e^{-iH_eff} - U_F| for each k
     """
     if k_values is None:
         k_values = np.linspace(0.5, 4.0, 36)
 
     min_gaps = []
     max_errs = []
-
     for k in k_values:
         U_F = floquet_U_exact(N, k, p)
         evals = np.linalg.eigvals(U_F)
-        args = np.angle(evals)           # in (-pi, pi]
+        args = np.angle(evals)  # in (-pi, pi]
         # distance from each eigenphase to the branch cut at pi
         gaps = np.abs(np.abs(args) - np.pi)
         min_gap = float(gaps.min())
@@ -127,6 +131,7 @@ def branch_validity_check(N: int, k_values=None, p: float = np.pi / 2,
         # Compute H_eff via principal-branch log (scipy.linalg.logm,
         # not numpy -- numpy has no logm)
         H_eff = 1j * scipy_logm(U_F)
+
         # Verify: e^{-i H_eff} should reproduce U_F
         U_reconstructed = expm_unitary(-1j * H_eff)
         max_err = float(np.max(np.abs(U_reconstructed - U_F)))
@@ -139,10 +144,10 @@ def branch_validity_check(N: int, k_values=None, p: float = np.pi / 2,
         print(f"\n=== BRANCH VALIDITY CHECK (N={N}) ===")
         print(f"  min spectral gap to branch cut (min|arg(lambda)-pi|):")
         print(f"    across k in [{k_values[0]:.1f}, {k_values[-1]:.1f}]: "
-              f"min={min_gaps.min():.4f} rad  at k={k_values[np.argmin(min_gaps)]:.2f}")
+              f"min={min_gaps.min():.4f} rad at k={k_values[np.argmin(min_gaps)]:.2f}")
         print(f"    -> {'OK (well-defined)' if min_gaps.min() > 0.01 else 'WARNING: eigenphase close to branch cut'}")
         print(f"  max |e^(-i H_eff) - U_F|:")
-        print(f"    across k: max={max_errs.max():.2e}  "
+        print(f"    across k: max={max_errs.max():.2e} "
               f"at k={k_values[np.argmax(max_errs)]:.2f}")
         print(f"    -> {'OK (< 1e-10)' if max_errs.max() < 1e-10 else 'WARNING: reconstruction error'}")
 
@@ -153,9 +158,9 @@ def branch_validity_check(N: int, k_values=None, p: float = np.pi / 2,
                   f"max element error={max_errs[idx]:.2e}")
 
         print("\n>>> FOR APPENDIX A (manuscript):")
-        print(f"    min spectral gap = {min_gaps.min():.4f} rad "
+        print(f"  min spectral gap = {min_gaps.min():.4f} rad "
               f"(well away from 0, branch is valid)")
-        print(f"    max element-wise |e^(-iH_eff) - U_F| = {max_errs.max():.2e}")
+        print(f"  max element-wise |e^(-iH_eff) - U_F| = {max_errs.max():.2e}")
 
     return {"k_values": k_values,
             "min_spectral_gap": min_gaps,
@@ -178,13 +183,15 @@ def _pauli_basis_1q():
 def pauli_decompose_heff(N: int, k: float, p: float = np.pi / 2,
                           verbose: bool = True):
     """Decompose H_eff = i log(U_F) in the n-qubit Pauli basis.
+
     Reports the fraction of the Frobenius norm coming from:
-      - ZZ nearest-neighbour terms  (the ansatz has these)
-      - ZZ all-to-all terms         (the ansatz has only NN)
-      - YZ nearest-neighbour terms  (ADAPT-VQA pool includes these)
+      - ZZ nearest-neighbour terms (the ansatz has these)
+      - ZZ all-to-all terms (the ansatz has only NN)
+      - YZ nearest-neighbour terms (ADAPT-VQA pool includes these)
       - everything else
 
     Returns dict with norm fractions.
+
     This directly addresses reviewer M7 (whether YZ is significant in H_eff,
     which would confound the ADAPT-VQA comparison).
     """
@@ -216,7 +223,7 @@ def pauli_decompose_heff(N: int, k: float, p: float = np.pi / 2,
             return False
         i1, l1 = active[0]; i2, l2 = active[1]
         return l1 == "Z" and l2 == "Z" and (i2 - i1 == 1 or
-                                              (i1 == 0 and i2 == N - 1))
+                                             (i1 == 0 and i2 == N - 1))
 
     def is_all_to_all_zz(label):
         active = [(i, l) for i, l in enumerate(label) if l != "I"]
@@ -238,36 +245,33 @@ def pauli_decompose_heff(N: int, k: float, p: float = np.pi / 2,
         cs = abs(c) ** 2
         if is_nn_zz(label):
             ns_nn_zz += cs
-        if is_all_to_all_zz(label):   # includes NN ZZ
+        if is_all_to_all_zz(label):  # includes NN ZZ
             ns_all_zz += cs
         if is_nn_yz(label):
             ns_nn_yz += cs
         if not is_all_to_all_zz(label) and not is_nn_yz(label):
             ns_other += cs
 
-    frac_nn_zz  = ns_nn_zz  / max(norm_sq_total, 1e-30)
+    frac_nn_zz = ns_nn_zz / max(norm_sq_total, 1e-30)
     frac_all_zz = ns_all_zz / max(norm_sq_total, 1e-30)
-    frac_nn_yz  = ns_nn_yz  / max(norm_sq_total, 1e-30)
-    frac_other  = ns_other  / max(norm_sq_total, 1e-30)
+    frac_nn_yz = ns_nn_yz / max(norm_sq_total, 1e-30)
+    frac_other = ns_other / max(norm_sq_total, 1e-30)
 
     if verbose:
         print(f"\n=== PAULI DECOMPOSITION OF H_eff (N={N}, k={k}) ===")
         print(f"  Total Frobenius norm^2: {norm_sq_total:.4f}")
-        print(f"  NN ZZ fraction:       {frac_nn_zz*100:.2f}%  "
-              f"  (ansatz has these)")
-        print(f"  All-to-all ZZ fraction: {frac_all_zz*100:.2f}%  "
-              f"  (ansatz has only NN subset)")
-        print(f"  NN YZ fraction:         {frac_nn_yz*100:.2f}%  "
-              f"  (ADAPT-VQA pool includes these)")
+        print(f"  NN ZZ fraction:         {frac_nn_zz*100:.2f}%  (ansatz has these)")
+        print(f"  All-to-all ZZ fraction: {frac_all_zz*100:.2f}%  (ansatz has only NN subset)")
+        print(f"  NN YZ fraction:         {frac_nn_yz*100:.2f}%  (ADAPT-VQA pool includes these)")
         print(f"  Other fraction:         {frac_other*100:.2f}%")
         print(f"\n>>> FOR PAPER (Appendix B ADAPT-VQA comparison):")
         if frac_nn_yz < 0.01:
-            print(f"    YZ content < 1% -> pool difference is negligible.")
-            print(f"    The ADAPT-VQA CNOT comparison is not materially confounded.")
+            print(f"  YZ content < 1% -> pool difference is negligible.")
+            print(f"  The ADAPT-VQA CNOT comparison is not materially confounded.")
         else:
-            print(f"    YZ content = {frac_nn_yz*100:.1f}% -> the ADAPT-VQA pool")
-            print(f"    has access to operators the HEA cannot represent.")
-            print(f"    Flag this explicitly in the appendix comparison.")
+            print(f"  YZ content = {frac_nn_yz*100:.1f}% -> the ADAPT-VQA pool")
+            print(f"  has access to operators the HEA cannot represent.")
+            print(f"  Flag this explicitly in the appendix comparison.")
 
     return {
         "frac_nn_zz": frac_nn_zz,
@@ -276,6 +280,17 @@ def pauli_decompose_heff(N: int, k: float, p: float = np.pi / 2,
         "frac_other": frac_other,
         "norm_sq_total": norm_sq_total,
     }
+
+
+# ---------------------------------------------------------------------------
+# [PATCH] Backward-compatible alias
+#
+# otoc.py, loschmidt.py, and main.py all still call `floquet_U(N, k, p)`.
+# This is the exact same function as floquet_U_exact -- same signature,
+# same behavior -- just under the name those scripts expect.
+# ---------------------------------------------------------------------------
+
+floquet_U = floquet_U_exact
 
 
 # ---------------------------------------------------------------------------

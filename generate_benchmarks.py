@@ -8,20 +8,25 @@ from adapt_vqa_baseline import adapt_vqa_prepare, layerwise_prepare
 
 
 def run_benchmark(N=4, k=2.5, target_steps=(1, 2, 3, 4, 5),
-                  fid_target=0.99, seed=0):
+                   fid_target=0.99, seed=0):
     psi0 = coherent_product_state(N)
     U = floquet_U_exact(N, k, np.pi / 2)
-
     rows = []
     for t in target_steps:
         target = np.linalg.matrix_power(U, t) @ psi0
         adapt = adapt_vqa_prepare(psi0, target, N, fid_target=fid_target, seed=seed)
-        layer = layerwise_prepare(psi0, target, N, fid_target=fid_target, seed=seed)
+        # [PATCH] layerwise_prepare takes eps_opt (an INFIDELITY target),
+        # not fid_target (a FIDELITY target) -- these are 1 minus each
+        # other, not interchangeable by name alone. Passing fid_target=0.99
+        # straight through as eps_opt would ask for only 1% fidelity, not
+        # 99%, which would silently invalidate the F>=0.99 comparison this
+        # figure claims to make against ADAPT-VQA.
+        layer = layerwise_prepare(psi0, target, N, eps_opt=1.0 - fid_target, seed=seed)
         rows.append(dict(t=t,
-                         adapt_cnot=adapt["cnot_count"], adapt_cyc=adapt["opt_cycles"],
-                         adapt_fid=adapt["fidelity"],
-                         layer_cnot=layer["cnot_count"], layer_cyc=layer["opt_cycles"],
-                         layer_fid=layer["fidelity"]))
+            adapt_cnot=adapt["cnot_count"], adapt_cyc=adapt["opt_cycles"],
+            adapt_fid=adapt["fidelity"],
+            layer_cnot=layer["cnot_count"], layer_cyc=layer["opt_cycles"],
+            layer_fid=layer["fidelity"]))
         print(f"t={t}: ADAPT cnot={adapt['cnot_count']} cyc={adapt['opt_cycles']} "
               f"F={adapt['fidelity']:.3f} | LAYER cnot={layer['cnot_count']} "
               f"cyc={layer['opt_cycles']} F={layer['fidelity']:.3f}")
@@ -40,6 +45,7 @@ def plot_benchmark(rows, outfile="figures/benchmark_adapt_vs_layerwise"):
     import os
     _aps_style()
     t = [r["t"] for r in rows]
+
     fig, ax = plt.subplots(1, 2, figsize=(7.0, 2.7), constrained_layout=True)
 
     ax[0].plot(t, [r["adapt_cnot"] for r in rows], "o-", color="#D55E00",

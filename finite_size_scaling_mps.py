@@ -58,12 +58,12 @@ def build_qkt_floquet_step(N, k, p):
     if not _HAS_QISKIT:
         raise ImportError("qiskit required")
     qc = QuantumCircuit(N)
-    theta = k / (N / 2)
+    theta = k / N  # was k/(N/2) — coupling was 2x too strong
+    for i in range(N):
+        qc.ry(p, i)          # rotation now applied first (was second — wrong order)
     for i in range(N):
         for j in range(i + 1, N):
             qc.rzz(theta, i, j)
-    for i in range(N):
-        qc.ry(p, i)
     return qc
 
 
@@ -208,7 +208,7 @@ if __name__ == "__main__":
     N_LIST    = [12, 16]
     K_VALS    = [0.5, 2.5]
     P_VAL     = np.pi / 2
-    MAX_STEPS = 15
+    MAX_STEPS = 12
 
     if not _HAS_QISKIT:
         print("Cannot run: qiskit not installed.")
