@@ -1,37 +1,41 @@
+[CHECKPOINT] Loaded 6 completed (N,k) result(s) from figures/depth_scaling_checkpoint.json (config matches current run).
 
 =======================================================
 N=4 | chaotic (k=2.5) …
-  [RESTORED FROM PRIOR RUN, NOT RECOMPUTED]
+  [RESTORED FROM CHECKPOINT, NOT RECOMPUTED -- n_restarts=50 matches saved config]
   → mean depth=2.40 ± 0.70, max=3, over 10 steps
 N=4 | regular (k=0.5) …
-  [RESTORED FROM PRIOR RUN, NOT RECOMPUTED]
+  [RESTORED FROM CHECKPOINT, NOT RECOMPUTED -- n_restarts=50 matches saved config]
   → mean depth=1.70 ± 0.67, max=3, over 10 steps
 
 =======================================================
 N=6 | chaotic (k=2.5) …
-  [RESTORED FROM PRIOR RUN, NOT RECOMPUTED]
-  → mean depth=4.25 ± 0.96, max=5, over 4 steps
+  [RESTORED FROM CHECKPOINT, NOT RECOMPUTED -- n_restarts=50 matches saved config]
+  → mean depth=3.75 ± 0.50, max=4, over 4 steps
 N=6 | regular (k=0.5) …
-  [RESTORED FROM PRIOR RUN, NOT RECOMPUTED]
-  → mean depth=2.60 ± 1.26, max=4, over 10 steps
+  [RESTORED FROM CHECKPOINT, NOT RECOMPUTED -- n_restarts=50 matches saved config]
+  → mean depth=2.44 ± 1.24, max=4, over 9 steps
 
 =======================================================
 N=8 | chaotic (k=2.5) …
-  [RESTORED FROM PRIOR RUN, NOT RECOMPUTED]
-  → mean depth=10.00 ± 5.66, max=14, over 2 steps
+  [RESTORED FROM CHECKPOINT, NOT RECOMPUTED -- n_restarts=50 matches saved config]
+  → mean depth=6.00 ± 0.00, max=6, over 1 steps
 N=8 | regular (k=0.5) …
-  [RESTORED FROM PRIOR RUN, NOT RECOMPUTED]
-  → mean depth=3.40 ± 3.91, max=10, over 5 steps
+  [RESTORED FROM CHECKPOINT, NOT RECOMPUTED -- n_restarts=50 matches saved config]
+  → mean depth=2.60 ± 2.30, max=6, over 5 steps
 
 =======================================================
 N=10 | chaotic (k=2.5) …
-  [RESTORED FROM PRIOR RUN, NOT RECOMPUTED]
-  → mean depth=16.00 ± 0.00, max=16, over 1 steps
+  N=10 k=2.5 t= 1: time budget (2500 s) reached mid-search at D=2; discarding this partial step, reporting over 0 step(s).
+  N=10 k=2.5: time budget reached before any step could be evaluated -- reporting nothing for this (N,k).
+  [COMPUTED FRESH -- checkpointed to figures/depth_scaling_checkpoint.json]
+  → mean depth=nan ± nan, max=0, over 0 steps
 N=10 | regular (k=0.5) …
   N=10 k=0.5 t= 1: min sufficient depth=1
   N=10 k=0.5 t= 2: min sufficient depth=1
   N=10 k=0.5 t= 3: min sufficient depth=1
-  N=10 k=0.5 t= 4: time budget (600 s) reached mid-search at D=2; discarding this partial step, reporting over 3 step(s).
+  N=10 k=0.5 t= 4: time budget (2500 s) reached mid-search at D=2; discarding this partial step, reporting over 3 step(s).
+  [COMPUTED FRESH -- checkpointed to figures/depth_scaling_checkpoint.json]
   → mean depth=1.00 ± 0.00, max=1, over 3 steps
   [saved figures/depth_scaling.png  (N=[np.int64(4), np.int64(6), np.int64(8), np.int64(10)])]
 
@@ -40,18 +44,18 @@ N=10 | regular (k=0.5) …
 % PASTE INTO TEX — depth_scaling results
 % ============================================================
 % N= 4  chaotic: <D>=2.40+/-0.70 (10-step avg) | regular: <D>=1.70+/-0.67 (10-step avg)
-% N= 6  chaotic: <D>=4.25+/-0.96 (4-step avg) | regular: <D>=2.60+/-1.26 (10-step avg)
-% N= 8  chaotic: <D>=10.00+/-5.66 (2-step avg) | regular: <D>=3.40+/-3.91 (5-step avg)
-% N=10  chaotic: <D>=16.00+/-0.00 (lower bound) | regular: <D>=1.00+/-0.00 (3-step avg)
+% N= 6  chaotic: <D>=3.75+/-0.50 (4-step avg) | regular: <D>=2.44+/-1.24 (9-step avg)
+% N= 8  chaotic: <D>=6.00+/-0.00 (lower bound) | regular: <D>=2.60+/-2.30 (5-step avg)
+% N=10  chaotic: <D>=nan+/-nan (lower bound) | regular: <D>=1.00+/-0.00 (3-step avg)
 %
 % Suggested table rows:
 % \hline
 % 4 & $1.7\pm0.7$ & $2.4\pm0.7$ \\
-% 6 & $2.6\pm1.3$ & $4.2\pm1.0$ \\
-% 8 & $3.4\pm3.9$ & $10.0\pm5.7$ \\
-% 10 & $1.0\pm0.0$ & $16.0\pm0.0$\dag \\
+% 6 & $2.4\pm1.2$ & $3.8\pm0.5$ \\
+% 8 & $2.6\pm2.3$ & $6.0\pm0.0$\dag \\
+% 10 & $1.0\pm0.0$ & $nan\pmnan$\dag \\
 % \hline
 % (dag = single-step lower bound; use open square in caption)
 %
-[B3 NOTE] N=8 chaotic: 2 step(s) averaged. Mean depth = 10.00 ± 5.66. Open marker still drawn (largest N); remove '(lower bound)' from caption if t-avg is considered sufficient.
-[B3 FLAG] N=10 chaotic: only 1 step(s) evaluated. Mean depth = 16.00 → LOWER BOUND. Open marker drawn; keep open-marker language in caption.
+[B3 FLAG] N=8 chaotic: only 1 step(s) evaluated. Mean depth = 6.00 → LOWER BOUND. Open marker drawn; keep open-marker language in caption.
+[B3 FLAG] N=10 chaotic: only 0 step(s) evaluated. Mean depth = nan → LOWER BOUND. Open marker drawn; keep open-marker language in caption.

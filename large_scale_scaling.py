@@ -5,12 +5,38 @@ CHANGES FROM ORIGINAL (open-task list):
   [B3/Fig12-annotation] N=8 chaotic point is ALWAYS drawn as an open square
     and ALWAYS annotated on-plot with a text label -- no longer conditional on
     n_eval<=1.  Text adapts: "1 step (lower bound)" vs "{n} steps (t-avg)".
-  [multi-step-N8]  TIME_BUDGET for N=8 raised to 600 s so multiple Floquet
+  [multi-step-N8]  TIME_BUDGET for N=8 raised so multiple Floquet
     steps are averaged wherever the machine allows.
-  [N10]  system_sizes now includes N=10 with a 600 s budget.  If N=10 runs
+  [N10]  system_sizes now includes N=10 with its own budget.  If N=10 runs
     out of time or memory it is skipped gracefully and flagged in stdout.
   [TeX-output]  All numerical results are printed at the end in a form that
     can be pasted directly into the manuscript.
+
+CHANGES FOR 50-RESTART RERUN (this version):
+  [N_RESTARTS]  Bumped 12 -> 50 to match Table III's stated methodology
+    ("Optimizer restarts -- 50") instead of leaving Fig. 11/12 on a silently
+    weaker search than every other depth result in the paper.
+  [TIME_BUDGET_TABLE]  Scaled by the same 50/12 ~= 4.17x factor, since the
+    restart loop below runs every restart to completion before declaring a
+    depth insufficient, so per-depth cost scales ~linearly with n_restarts.
+    Leaving the old (12-restart-tuned) budgets in place would have caused
+    this run to evaluate even fewer Floquet steps than the sparse 1-2 you
+    already have at N=8/10 -- possibly zero. Treat these as a floor, not a
+    target: raise further if you want denser step coverage.
+  [PRECOMPUTED -> checkpoint]  The old PRECOMPUTED dict hardcoded results
+    computed under N_RESTARTS=12. Setting N_RESTARTS=50 without touching
+    that dict would have caused the script to print
+    "[RESTORED FROM PRIOR RUN, NOT RECOMPUTED]" and silently reuse the old
+    12-restart numbers for every N -- defeating the entire point of this
+    change. It has been replaced with a disk-backed checkpoint
+    (figures/depth_scaling_checkpoint.json) keyed on the FULL run config
+    (eps_opt, n_steps, ceiling_offset, n_restarts). If the saved config
+    doesn't match the current constants below, the checkpoint is ignored
+    and everything recomputes fresh -- this class of bug (silently reusing
+    results computed under a different setting) can't happen again even if
+    you change N_RESTARTS a third time. It also checkpoints incrementally
+    after each (N, k) finishes, not just at the very end of main(), so a
+    crash on N=10 no longer costs you the already-finished N=4/6/8 results.
 
 All other logic (depth search, Ansatz, regular/chaotic split, residual-first
 policy, etc.) is UNCHANGED from the corrected original.
@@ -31,36 +57,83 @@ EPS_OPT        = 0.05
 N_STEPS        = 10          # max Floquet steps to attempt per (N, k)
 K_CHAOTIC      = 2.5
 K_REGULAR      = 0.5
-N_RESTARTS     = 12
+N_RESTARTS     = 50          # was 12 -- now matches Table III's stated "50"
 CEILING_OFFSET = 6
 MAXITER        = 200
 
-# N=8 budget raised from 180 s → 600 s; N=10 given 600 s.
-TIME_BUDGET_TABLE = {4: 60.0, 6: 150.0, 8: 600.0, 10: 600.0}
-TIME_BUDGET_DEFAULT = 600.0
+# Scaled from the original {4: 60.0, 6: 150.0, 8: 600.0, 10: 600.0} by the
+# same 50/12 ~= 4.1667x factor as N_RESTARTS, since the restart loop runs to
+# completion on failure (needed to certify a depth "insufficient"), so cost
+# scales ~linearly with n_restarts. This is a starting point, not a
+# guarantee of full 10-step coverage at N=8/10 -- it wasn't enough for that
+# even at 12 restarts. Raise further if you want denser data and are
+# willing to let it run longer (overnight with caffeinate, as before).
+TIME_BUDGET_TABLE = {4: 250.0, 6: 625.0, 8: 2500.0, 10: 2500.0}
+TIME_BUDGET_DEFAULT = 2500.0
 
 # Set to False to skip N=10 (fast CI run):
 TRY_N10 = True
 
-# ── [PATCH] Results already obtained before the machine died mid-run on
-# N=10. Restored verbatim from the terminal output of that run so we don't
-# burn time recomputing N=4/6/8, which are deterministic given the fixed
-# per-point RNG seed (N, t, D, r) -- rerunning them would give byte-identical
-# numbers anyway, just slowly. Format: (mean, std, max, n_steps, all_converged).
-PRECOMPUTED = {
-    (4, 2.5): (2.40, 0.70, 3, 10, True),   # N=4 chaotic
-    (4, 0.5): (1.70, 0.67, 3, 10, True),   # N=4 regular
-    (6, 2.5): (4.25, 0.96, 5, 4, True),    # N=6 chaotic (time budget after t=4)
-    (6, 0.5): (2.60, 1.26, 4, 10, True),   # N=6 regular
-    (8, 2.5): (10.00, 5.66, 14, 2, False), # N=8 chaotic (t=2 hit ceiling)
-    (8, 0.5): (3.40, 3.91, 10, 5, True),   # N=8 regular (time budget after t=5)
-    (10, 2.5): (16.00, 0.00, 16, 1, False), # N=10 chaotic (t=1 hit ceiling=16, confirmed complete)
-    # N=10 regular is NOT precomputed -- it got through t=1,2,3 (all D=1)
-    # before the old unbounded-mid-t bug caused a 36-hour stall. It will
-    # rerun from t=1, but is now genuinely bounded by the fixed time check
-    # below, so even a slow t will stop within the 600s budget instead of
-    # hanging.
-}
+# ── [PATCH] Disk-backed checkpoint, replacing the old hardcoded PRECOMPUTED
+# dict. Keyed on the full run config so results computed under a different
+# N_RESTARTS (or eps_opt / n_steps / ceiling_offset) are never silently
+# reused -- if the saved config doesn't match, the checkpoint is ignored
+# and that (N, k) recomputes fresh. Saved incrementally after every (N, k)
+# so a crash partway through (e.g. during N=10) doesn't lose the results
+# already computed for smaller N.
+CHECKPOINT_PATH = "figures/depth_scaling_checkpoint.json"
+
+
+def _checkpoint_config():
+    return {
+        "eps_opt": EPS_OPT,
+        "n_steps": N_STEPS,
+        "ceiling_offset": CEILING_OFFSET,
+        "n_restarts": N_RESTARTS,
+    }
+
+
+def _load_checkpoint():
+    """Load per-(N,k) results already computed under the CURRENT config.
+    If no checkpoint file exists, or it was written under a different
+    config (e.g. an older N_RESTARTS=12 run), returns an empty cache so
+    every (N,k) recomputes fresh -- rather than silently mixing results
+    computed under different restart counts."""
+    if not os.path.exists(CHECKPOINT_PATH):
+        return {}
+    try:
+        with open(CHECKPOINT_PATH) as fh:
+            raw = json.load(fh)
+    except (json.JSONDecodeError, OSError):
+        print(f"[CHECKPOINT] {CHECKPOINT_PATH} unreadable -- starting fresh.",
+              flush=True)
+        return {}
+
+    if raw.get("config") != _checkpoint_config():
+        print(f"[CHECKPOINT] Found {CHECKPOINT_PATH} but its config "
+              f"{raw.get('config')} does not match the current config "
+              f"{_checkpoint_config()} -- ignoring stale checkpoint, "
+              f"recomputing everything under the current config.",
+              flush=True)
+        return {}
+
+    cache = {}
+    for key_str, v in raw.get("results", {}).items():
+        N_str, k_str = key_str.split(",")
+        cache[(int(N_str), float(k_str))] = tuple(v)
+    if cache:
+        print(f"[CHECKPOINT] Loaded {len(cache)} completed (N,k) result(s) "
+              f"from {CHECKPOINT_PATH} (config matches current run).",
+              flush=True)
+    return cache
+
+
+def _save_checkpoint(cache):
+    os.makedirs(os.path.dirname(CHECKPOINT_PATH) or ".", exist_ok=True)
+    serializable = {f"{N},{k}": list(v) for (N, k), v in cache.items()}
+    with open(CHECKPOINT_PATH, "w") as fh:
+        json.dump({"config": _checkpoint_config(), "results": serializable},
+                  fh, indent=2)
 
 
 # ── Core search ─────────────────────────────────────────────────────────────
@@ -320,6 +393,8 @@ def main():
     if TRY_N10:
         system_sizes.append(10)
 
+    checkpoint = _load_checkpoint()
+
     mean_cha, std_cha, max_cha = [], [], []
     mean_reg, std_reg, max_reg = [], [], []
     neval_cha, neval_reg       = [], []
@@ -331,12 +406,13 @@ def main():
         print(f"\n{'='*55}")
         print(f"N={N} | chaotic (k={K_CHAOTIC}) …")
         key_cha = (N, K_CHAOTIC)
-        if key_cha in PRECOMPUTED:
-            m, s, mx, ne, _ = PRECOMPUTED[key_cha]
-            print(f"  [RESTORED FROM PRIOR RUN, NOT RECOMPUTED]")
+        if key_cha in checkpoint:
+            m, s, mx, ne, _ = checkpoint[key_cha]
+            print(f"  [RESTORED FROM CHECKPOINT, NOT RECOMPUTED "
+                  f"-- n_restarts={N_RESTARTS} matches saved config]")
         else:
             try:
-                m, s, mx, ne, _ = depth_stats(N, K_CHAOTIC)
+                m, s, mx, ne, conv = depth_stats(N, K_CHAOTIC)
             except MemoryError:
                 print(f"  N={N} chaotic: MemoryError — skipping N={N}.", flush=True)
                 if N == 10:
@@ -344,20 +420,27 @@ def main():
                           "Set TRY_N10=False to suppress.", flush=True)
                 system_sizes = system_sizes[:system_sizes.index(N)]
                 break
+            checkpoint[key_cha] = (m, s, mx, ne, conv)
+            _save_checkpoint(checkpoint)
+            print(f"  [COMPUTED FRESH -- checkpointed to {CHECKPOINT_PATH}]")
         print(f"  → mean depth={m:.2f} ± {s:.2f}, max={mx}, over {ne} steps")
         mean_cha.append(m); std_cha.append(s); max_cha.append(mx); neval_cha.append(ne)
 
         print(f"N={N} | regular (k={K_REGULAR}) …")
         key_reg = (N, K_REGULAR)
-        if key_reg in PRECOMPUTED:
-            m, s, mx, ne, _ = PRECOMPUTED[key_reg]
-            print(f"  [RESTORED FROM PRIOR RUN, NOT RECOMPUTED]")
+        if key_reg in checkpoint:
+            m, s, mx, ne, _ = checkpoint[key_reg]
+            print(f"  [RESTORED FROM CHECKPOINT, NOT RECOMPUTED "
+                  f"-- n_restarts={N_RESTARTS} matches saved config]")
         else:
             try:
-                m, s, mx, ne, _ = depth_stats(N, K_REGULAR)
+                m, s, mx, ne, conv = depth_stats(N, K_REGULAR)
             except MemoryError:
                 print(f"  N={N} regular: MemoryError — using placeholder.", flush=True)
-                m, s, mx, ne = (mean_reg[-1] if mean_reg else 1.0), 0.0, 1, 0
+                m, s, mx, ne, conv = (mean_reg[-1] if mean_reg else 1.0), 0.0, 1, 0, False
+            checkpoint[key_reg] = (m, s, mx, ne, conv)
+            _save_checkpoint(checkpoint)
+            print(f"  [COMPUTED FRESH -- checkpointed to {CHECKPOINT_PATH}]")
         print(f"  → mean depth={m:.2f} ± {s:.2f}, max={mx}, over {ne} steps")
         mean_reg.append(m); std_reg.append(s); max_reg.append(mx); neval_reg.append(ne)
 

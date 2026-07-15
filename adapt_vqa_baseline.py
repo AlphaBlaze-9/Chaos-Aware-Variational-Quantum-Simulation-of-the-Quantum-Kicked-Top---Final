@@ -15,6 +15,16 @@ CHANGES FROM ORIGINAL (open-task list):
     retained and now saves both the figure and a JSON file with the raw
     variance data for TeX reference.
   [tex-output]  Every new function prints clearly labelled % TeX blocks.
+  [dmax_map -> live loader]  The hardcoded dmax_map = {4:4, 6:10, 8:23,
+    10:25} used by TASK 3's barren-plateau comparison never matched any
+    real output of large_scale_scaling.py (real chaotic max-depths are
+    {4:3, 6:5, 8:14, 10:16}) -- it was a placeholder that the comment above
+    it ("Update these values AFTER running large_scale_scaling.py!") was
+    never actually followed for. Replaced with
+    _load_adaptive_depths_from_scaling_results(), which reads
+    figures/depth_scaling_results.json directly instead of a hand-typed
+    dict, so this can't silently go stale again the next time
+    large_scale_scaling.py is rerun (e.g. at N_RESTARTS=50).
 
 All prior logic (build_pool, _apply_op, _state_from_ops, adapt_vqa_prepare,
 layerwise_prepare, _parameter_shift_gradient, barren_plateau_gradient_variance,
@@ -559,6 +569,57 @@ def plot_barren_plateau_variance(result,
     return result
 
 
+# ── Adaptive depths for TASK 3, loaded live instead of hand-typed ──────────
+
+def _load_adaptive_depths_from_scaling_results(
+        path="figures/depth_scaling_results.json",
+        which="max", regime="chaotic", n_steps_max=10):
+    """Load the per-N circuit depth to use in the barren-plateau comparison
+    directly from large_scale_scaling.py's saved output, instead of a
+    hand-maintained dict that can silently go stale (as the old
+    dmax_map = {4:4, 6:10, 8:23, 10:25} did -- it never matched any real
+    run of large_scale_scaling.py).
+
+    which : "max" uses the worst-case sufficient depth per N (the same
+        Dmax convention used elsewhere in the paper, e.g. Fig. 10) --
+        the natural choice here since a single fixed Ansatz depth is
+        used for every trial at that N, so it should be one that's
+        actually sufficient rather than merely typical.
+        "mean" uses <D>_t rounded to the nearest integer instead.
+
+    Raises FileNotFoundError rather than silently falling back to a
+    placeholder -- this analysis is explicitly future work (Sec. IV C of
+    the paper currently defers it), so if the prerequisite data isn't on
+    disk yet, run large_scale_scaling.py first rather than guessing.
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"{path} not found. The barren-plateau adaptive-depth "
+            f"comparison (TASK 3) needs large_scale_scaling.py's saved "
+            f"results -- run that script first, then rerun this one.")
+    with open(path) as fh:
+        r = json.load(fh)
+
+    sizes = r["system_sizes"]
+    if which == "max":
+        depths = r[regime]["max_depth"]
+    elif which == "mean":
+        depths = [round(d) for d in r[regime]["mean_depth"]]
+    else:
+        raise ValueError(f"which must be 'max' or 'mean', got {which!r}")
+
+    n_eval = r[regime]["n_steps_evaluated"]
+    dmap   = dict(zip(sizes, depths))
+    for N, ne in zip(sizes, n_eval):
+        if ne < r.get("n_steps_max", n_steps_max):
+            print(f"[bp-depth] N={N}: adaptive depth {dmap[N]} is based on "
+                  f"only {ne} evaluated Floquet step(s) out of "
+                  f"{r.get('n_steps_max', n_steps_max)}, not the full "
+                  f"window -- same undersampling caveat as Fig. 11, treat "
+                  f"as provisional.", flush=True)
+    return dmap
+
+
 # ── __main__ ─────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -611,9 +672,15 @@ if __name__ == "__main__":
     BP_SYSTEM_SIZES = [4, 6, 8, 10]
     BP_DEPTH_FIXED  = 8
 
-    # Adaptive depths from large_scale_scaling results (chaotic, k=2.5).
-    # Update these values AFTER running large_scale_scaling.py!
-    dmax_map = {4: 4, 6: 10, 8: 23, 10: 25}
+    # Adaptive depths from large_scale_scaling.py's actual saved output
+    # (figures/depth_scaling_results.json), loaded live rather than
+    # hand-typed -- see _load_adaptive_depths_from_scaling_results() above.
+    # Uses the worst-case (max) sufficient depth per N in the chaotic
+    # regime, same convention as Dmax elsewhere in the paper. N=8 and N=10
+    # are based on only 2 and 1 evaluated Floquet step(s) respectively
+    # (printed as a warning below), same caveat as Fig. 11.
+    dmax_map = _load_adaptive_depths_from_scaling_results(
+        which="max", regime="chaotic")
 
     def bp_depth_adaptive_fn(N_):
         return dmax_map.get(N_, N_ + 6)
