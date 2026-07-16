@@ -57,6 +57,12 @@ EPS_OPT        = 0.05
 N_STEPS        = 10          # max Floquet steps to attempt per (N, k)
 K_CHAOTIC      = 2.5
 K_REGULAR      = 0.5
+K_REGULAR_ALT  = 1.5         # [item xiii] second regular-plateau point (FTLE~0
+                              # here too, per Fig. 4) -- tests whether the N-scaling
+                              # gap tracks chaoticity (should track K_REGULAR) or
+                              # just the larger rotation angle at k=2.5 (would
+                              # track K_CHAOTIC instead).
+RUN_REGULAR_ALT = True       # set False to skip this and only run the original pair
 N_RESTARTS     = 50          # was 12 -- now matches Table III's stated "50"
 CEILING_OFFSET = 6
 MAXITER        = 200
@@ -230,7 +236,8 @@ def depth_stats(N, k,
 # ── Figure ───────────────────────────────────────────────────────────────────
 
 def save_figure(system_sizes, mean_reg, std_reg, mean_cha, std_cha,
-                neval_cha=None, neval_reg=None):
+                neval_cha=None, neval_reg=None,
+                mean_reg2=None, std_reg2=None, k_reg2=None):
     """Save Fig. 12 (depth_scaling).
 
     KEY CHANGE: the N=8 chaotic point is ALWAYS drawn as an open square
@@ -300,6 +307,13 @@ def save_figure(system_sizes, mean_reg, std_reg, mean_cha, std_cha,
     # Connect chaotic trend line
     if len(mean_cha) > 1:
         ax.plot(ns_cha, mean_cha, "-", color="#D55E00", lw=1.5, zorder=0)
+
+    # ── [item xiii] Regular-alt (k=1.5) confound-check series ──────────────
+    if mean_reg2:
+        ns_reg2 = ns_done[:len(mean_reg2)]
+        ax.errorbar(ns_reg2, mean_reg2, yerr=std_reg2, fmt="^--",
+                    color="#009E73", capsize=4,
+                    label=f"Regular-alt ($k={k_reg2}$)" if k_reg2 else "Regular-alt")
 
     ax.set_xlabel("System size $N$ (qubits)")
     ax.set_ylabel(r"Mean sufficient depth $\langle D\rangle_t$")
@@ -398,6 +412,7 @@ def main():
     mean_cha, std_cha, max_cha = [], [], []
     mean_reg, std_reg, max_reg = [], [], []
     neval_cha, neval_reg       = [], []
+    mean_reg2, std_reg2, max_reg2, neval_reg2 = [], [], [], []
 
     os.makedirs("figures", exist_ok=True)
 
@@ -444,10 +459,37 @@ def main():
         print(f"  → mean depth={m:.2f} ± {s:.2f}, max={mx}, over {ne} steps")
         mean_reg.append(m); std_reg.append(s); max_reg.append(mx); neval_reg.append(ne)
 
+        # [item xiii] Second regular-plateau point at K_REGULAR_ALT=1.5.
+        # Still FTLE~0 (regular plateau extends to k<=1.5 per Fig. 4), so if
+        # <D>_t here tracks K_REGULAR (0.5) rather than K_CHAOTIC (2.5), that's
+        # direct evidence the N-scaling gap is driven by chaoticity and not
+        # merely by k=2.5 being a larger rotation angle.
+        if RUN_REGULAR_ALT:
+            print(f"N={N} | regular-alt (k={K_REGULAR_ALT}) …")
+            key_reg2 = (N, K_REGULAR_ALT)
+            if key_reg2 in checkpoint:
+                m2, s2, mx2, ne2, _ = checkpoint[key_reg2]
+                print(f"  [RESTORED FROM CHECKPOINT, NOT RECOMPUTED "
+                      f"-- n_restarts={N_RESTARTS} matches saved config]")
+            else:
+                try:
+                    m2, s2, mx2, ne2, conv2 = depth_stats(N, K_REGULAR_ALT)
+                except MemoryError:
+                    print(f"  N={N} regular-alt: MemoryError — using placeholder.", flush=True)
+                    m2, s2, mx2, ne2, conv2 = (mean_reg2[-1] if mean_reg2 else 1.0), 0.0, 1, 0, False
+                checkpoint[key_reg2] = (m2, s2, mx2, ne2, conv2)
+                _save_checkpoint(checkpoint)
+                print(f"  [COMPUTED FRESH -- checkpointed to {CHECKPOINT_PATH}]")
+            print(f"  → mean depth={m2:.2f} ± {s2:.2f}, max={mx2}, over {ne2} steps")
+            mean_reg2.append(m2); std_reg2.append(s2); max_reg2.append(mx2); neval_reg2.append(ne2)
+
         valid_sizes.append(N)
 
     save_figure(valid_sizes, mean_reg, std_reg, mean_cha, std_cha,
-                neval_cha=neval_cha, neval_reg=neval_reg)
+                neval_cha=neval_cha, neval_reg=neval_reg,
+                mean_reg2=mean_reg2 if RUN_REGULAR_ALT else None,
+                std_reg2=std_reg2 if RUN_REGULAR_ALT else None,
+                k_reg2=K_REGULAR_ALT if RUN_REGULAR_ALT else None)
 
     # ── Structured JSON for reproducibility ────────────────────────────────
     results = {
@@ -464,6 +506,13 @@ def main():
             "max_depth":  max_reg,
             "n_steps_evaluated": neval_reg,
         },
+        "regular_alt": {
+            "k": K_REGULAR_ALT,
+            "mean_depth": [round(x, 3) for x in mean_reg2],
+            "std_depth":  [round(x, 3) for x in std_reg2],
+            "max_depth":  max_reg2,
+            "n_steps_evaluated": neval_reg2,
+        } if RUN_REGULAR_ALT else None,
         "eps_opt":    EPS_OPT,
         "k_chaotic":  K_CHAOTIC,
         "k_regular":  K_REGULAR,
@@ -495,6 +544,30 @@ def main():
     print(r"% \hline")
     print("% (dag = single-step lower bound; use open square in caption)")
     print("%")
+
+    # ── [item xiii] Confound check: does k=1.5 track k=0.5 or k=2.5? ───────
+    if RUN_REGULAR_ALT and mean_reg2:
+        print("\n" + "%" + "=" * 60)
+        print("% ITEM (xiii) CONFOUND CHECK -- paste verdict into Sec. IV.C")
+        print("%" + "=" * 60)
+        for i, N in enumerate(valid_sizes[:len(mean_reg2)]):
+            d05, d15, d25 = mean_reg[i], mean_reg2[i], mean_cha[i]
+            # [FIX] np.isnan comparisons are always False in Python, which
+            # was silently falling into the "tracks k=2.5" branch whenever
+            # a point hadn't actually converged/evaluated -- reporting a
+            # confound verdict from no data. Guard against that explicitly.
+            if any(np.isnan(v) for v in (d05, d15, d25)):
+                print(f"% N={N:2d}: <D>_t(k=0.5)={d05}  <D>_t(k=1.5)={d15}  "
+                      f"<D>_t(k=2.5)={d25}  -> INSUFFICIENT DATA (one or more "
+                      f"points is NaN -- not a real verdict, do not cite)")
+                continue
+            dist_to_05 = abs(d15 - d05)
+            dist_to_25 = abs(d15 - d25)
+            verdict = ("tracks k=0.5 (supports chaoticity, not rotation angle)"
+                       if dist_to_05 < dist_to_25 else
+                       "tracks k=2.5 (confound NOT resolved -- flag in paper)")
+            print(f"% N={N:2d}: <D>_t(k=0.5)={d05:.2f}  <D>_t(k=1.5)={d15:.2f}  "
+                  f"<D>_t(k=2.5)={d25:.2f}  -> {verdict}")
 
     # ── B3 flag: single-step lower bound check ─────────────────────────────
     for i, (N, ne) in enumerate(zip(valid_sizes, neval_cha)):

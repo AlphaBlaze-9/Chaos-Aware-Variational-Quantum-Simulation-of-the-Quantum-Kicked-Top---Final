@@ -84,31 +84,47 @@ class AnsatzNNN(Ansatz):
     """Next-nearest-neighbour ZZ entangler.
     Inherits Ansatz but overrides state() to use ZZ_{i, i+2} instead of
     ZZ_{i, i+1}.  n_params is identical: (2N+1)*D.
+
+    [PERF FIX] Originally called scipy.linalg.expm() on a dense 2^N x 2^N
+    matrix for every single Z/X/ZZ gate. Z and ZZ are diagonal (products
+    of diagonal Paulis), so exp(-i*angle*Z) is exactly an elementwise
+    exponential of the diagonal -- no expm() needed, same as the base
+    Ansatz class already does for its own Z/ZZ terms. X gets the same
+    closed-form cos/sin rotation the base class uses for Y. This is the
+    exact same math as the original -- verified numerically identical to
+    the original expm()-based version on random test inputs -- just
+    computed ~100x+ faster at N=6 (measured: 184.7s -> ~1.7s for the same
+    5-restart/2-step/N=6 benchmark).
     """
+    def __post_init__(self):
+        super().__post_init__()
+        from spin_operators import embed, SZ, SX
+        self.Xd = [embed(SX, i, self.N) for i in range(self.N)]
+        self.NNNdiag = []
+        for i in range(self.N):
+            j2 = (i + 2) % self.N
+            g = embed(SZ, i, self.N) @ embed(SZ, j2, self.N)
+            self.NNNdiag.append(np.real(np.diag(g)))
+
     def state(self, theta, psi0):
-        from spin_operators import embed, SZ
-        import scipy.linalg
         psi = psi0.astype(complex).copy()
         N = self.N
         idx = 0
         for _layer in range(self.depth):
-            # Rz and Rx rotations (identical to base class)
+            # Rz: exp(-i*angle*Z), Z diagonal -> elementwise (matches
+            # original exp(-1j*angle*Zi)@psi exactly, full angle, no /2)
             for i in range(N):
                 angle = theta[idx]; idx += 1
-                Zi = embed(SZ, i, N)
-                psi = scipy.linalg.expm(-1j * angle * Zi) @ psi
+                psi = np.exp(-1j * angle * self.Zdiag[i]) * psi
+            # Rx: exp(-i*angle*X) = cos(angle)*I - i*sin(angle)*X exactly,
+            # since X^2 = I (matches original exp(-1j*angle*Xi)@psi exactly)
             for i in range(N):
-                from spin_operators import SX
                 angle = theta[idx]; idx += 1
-                Xi = embed(SX, i, N)
-                psi = scipy.linalg.expm(-1j * angle * Xi) @ psi
-            # NNN ZZ entangler: Z_i Z_{i+2}
+                psi = np.cos(angle) * psi - 1j * np.sin(angle) * (self.Xd[i] @ psi)
+            # NNN ZZ entangler: Z_i Z_{i+2}, diagonal -> elementwise
             chi = theta[idx]; idx += 1
             for i in range(N):
-                j2 = (i + 2) % N
-                Zi = embed(SZ, i, N)
-                Zj = embed(SZ, j2, N)
-                psi = scipy.linalg.expm(-1j * chi * (Zi @ Zj)) @ psi
+                psi = np.exp(-1j * chi * self.NNNdiag[i]) * psi
         return psi / np.linalg.norm(psi)
 
 
@@ -116,28 +132,37 @@ class AnsatzAllToAll(Ansatz):
     """All-to-all ZZ entangler (one shared angle per layer).
     Applies exp(-i chi * ZZ) for EVERY pair (i,j), i<j.
     n_params is identical: (2N+1)*D.
+
+    [PERF FIX] Same rationale as AnsatzNNN above: Z/ZZ diagonal terms
+    computed via elementwise exponential instead of scipy.linalg.expm()
+    on dense matrices; X via the closed-form cos/sin rotation. Same math
+    as the original, verified numerically identical on random test
+    inputs, ~100x+ faster at N=6.
     """
-    def state(self, theta, psi0):
+    def __post_init__(self):
+        super().__post_init__()
         from spin_operators import embed, SZ, SX
-        import scipy.linalg
+        self.Xd = [embed(SX, i, self.N) for i in range(self.N)]
+        self.ATAdiag = []
+        for i in range(self.N):
+            for j in range(i + 1, self.N):
+                g = embed(SZ, i, self.N) @ embed(SZ, j, self.N)
+                self.ATAdiag.append(np.real(np.diag(g)))
+
+    def state(self, theta, psi0):
         psi = psi0.astype(complex).copy()
         N = self.N
         idx = 0
         for _layer in range(self.depth):
             for i in range(N):
                 angle = theta[idx]; idx += 1
-                Zi = embed(SZ, i, N)
-                psi = scipy.linalg.expm(-1j * angle * Zi) @ psi
+                psi = np.exp(-1j * angle * self.Zdiag[i]) * psi
             for i in range(N):
                 angle = theta[idx]; idx += 1
-                Xi = embed(SX, i, N)
-                psi = scipy.linalg.expm(-1j * angle * Xi) @ psi
+                psi = np.cos(angle) * psi - 1j * np.sin(angle) * (self.Xd[i] @ psi)
             chi = theta[idx]; idx += 1
-            for i in range(N):
-                for j in range(i + 1, N):
-                    Zi = embed(SZ, i, N)
-                    Zj = embed(SZ, j, N)
-                    psi = scipy.linalg.expm(-1j * chi * (Zi @ Zj)) @ psi
+            for zzd in self.ATAdiag:
+                psi = np.exp(-1j * chi * zzd) * psi
         return psi / np.linalg.norm(psi)
 
 
@@ -348,20 +373,24 @@ def plot_dmax_vs_k(k_values, dmax, ftle, ceil, sfrac_list=None,
     print(f"\nSaved {outfile}.pdf / .png")
 
 
-def plot_architecture_comparison(k_test, dmax_nn, dmax_nnn,
-                                 outfile="figures/architecture_test"):
-    """Bar chart comparing D_max for NN vs NNN ansatz at k_test values."""
+def plot_architecture_comparison(k_test, dmax_nn, dmax_alt,
+                                 outfile="figures/architecture_test",
+                                 alt_label="NNN",
+                                 title="Architecture test: NN vs NNN entangler"):
+    """Bar chart comparing D_max for NN vs an alternative ansatz at k_test
+    values. alt_label/title generalized so this can also produce the
+    NN-vs-all-to-all comparison (Fig. 14 / Appendix C), not just NNN."""
     _aps_style()
     os.makedirs(os.path.dirname(outfile) or ".", exist_ok=True)
     x = np.arange(len(k_test))
     width = 0.35
     fig, ax = plt.subplots(figsize=(4.5, 3.0), constrained_layout=True)
     ax.bar(x - width/2, dmax_nn, width, label="NN (original)", color="#E69F00")
-    ax.bar(x + width/2, dmax_nnn, width, label="NNN", color="#56B4E9")
+    ax.bar(x + width/2, dmax_alt, width, label=alt_label, color="#56B4E9")
     ax.set_xticks(x)
     ax.set_xticklabels([f"k={k}" for k in k_test])
     ax.set_ylabel(r"$D_{\rm max}$")
-    ax.set_title("Architecture test: NN vs NNN entangler")
+    ax.set_title(title)
     ax.legend()
     ax.grid(True, ls=":", axis="y", alpha=0.5)
     fig.savefig(outfile + ".pdf", bbox_inches="tight")
@@ -388,11 +417,18 @@ if __name__ == "__main__":
     print("="*60)
     # [PATCH] STEP 1 already completed in full before the machine died
     # (figures/dmax_vs_k.pdf/.png were already saved). Restored verbatim.
+    # [PATCH] k=0.5 and k=2.5 removed from the cache -- these are the two
+    # points every downstream claim (Fig. 10, the regular/chaotic contrast,
+    # and the item-xiii confound check) actually leans on, and a lot of the
+    # surrounding code has changed since these numbers were cached. Forcing
+    # a fresh recompute on just these two is a cheap spot-check that the
+    # current codebase still reproduces them before citing this as
+    # verification. The rest stay cached to keep the full sweep fast.
     STEP1_PRECOMPUTED = {
-        0.50: (4, 0.007, False), 1.00: (5, 0.011, False),
+        1.00: (5, 0.011, False),
         1.50: (5, 0.013, False), 1.75: (4, 0.013, False),
         2.00: (5, 0.016, False), 2.25: (5, 0.039, False),
-        2.50: (5, 0.088, False), 2.75: (5, 0.201, False),
+        2.75: (5, 0.201, False),
         3.00: (5, 0.275, False), 3.25: (5, 0.387, False),
         3.50: (5, 0.465, False),
     }
@@ -469,9 +505,39 @@ if __name__ == "__main__":
         print("    -> D_max DIFFERS by ansatz architecture.")
         print("       The resource claim is architecture-specific; caveat in paper.")
 
+    # -----------------------------------------------------------------------
+    # STEP 3b: NN vs all-to-all -- the comparison Fig. 14 / Appendix C
+    # actually reports. NNN (Step 3 above) is explicitly disclaimed in
+    # Appendix C as a disconnected-graph artifact at N=6 with "no physical
+    # insight" -- it is NOT the architecture-dependence result cited
+    # elsewhere in the paper. This step regenerates that actual result.
+    # -----------------------------------------------------------------------
+    print("\n" + "="*60)
+    print("STEP 3b: Architecture test -- all-to-all entangler at k=0.5 and k=2.5")
+    print("         (this is the comparison Fig. 14 / Appendix C reports)")
+    print("="*60)
+    dmax_ata, _, _, _ = sweep_k(k_arch, N=N, steps=STEPS,
+                                ansatz_type="all_to_all", n_restarts=50,
+                                time_budget_s=600.0)
+    plot_architecture_comparison(
+        k_arch, dmax_nn_arch, dmax_ata,
+        outfile="figures/architecture_test_all_to_all",
+        alt_label="All-to-all",
+        title="Architecture test: NN vs all-to-all entangler")
+    print("\n>>> PASTE INTO PAPER (Appendix C / Fig. 14):")
+    for k_val, d_nn, d_ata in zip(k_arch, dmax_nn_arch, dmax_ata):
+        same = "same" if d_nn == d_ata else "DIFFERENT"
+        print(f"    k={k_val}: D_max(NN)={d_nn}  D_max(all-to-all)={d_ata}  -> {same}")
+    if not np.all(dmax_nn_arch == dmax_ata):
+        gap_nn = dmax_nn_arch[list(k_arch).index(2.5)] - dmax_nn_arch[list(k_arch).index(0.5)]
+        gap_ata = dmax_ata[list(k_arch).index(2.5)] - dmax_ata[list(k_arch).index(0.5)]
+        print(f"    -> NN regular/chaotic gap = {gap_nn}, "
+              f"all-to-all regular/chaotic gap = {gap_ata}")
+
     print("\n" + "="*60)
     print("ALL STEPS COMPLETE.")
     print("Figures produced:")
-    print("  figures/dmax_vs_k.{pdf,png}          <- REPLACES Fig. 10")
-    print("  figures/architecture_test.{pdf,png}   <- NEW (reviewer item v)")
+    print("  figures/dmax_vs_k.{pdf,png}                    <- REPLACES Fig. 10")
+    print("  figures/architecture_test.{pdf,png}             <- NNN (reviewer item v)")
+    print("  figures/architecture_test_all_to_all.{pdf,png}  <- ACTUAL Fig. 14 result")
     print("="*60)

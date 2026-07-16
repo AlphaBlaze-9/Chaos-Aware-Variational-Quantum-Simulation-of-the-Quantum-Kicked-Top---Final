@@ -57,6 +57,33 @@
       3
     ]
   },
+  "regular_alt": {
+    "k": 1.5,
+    "mean_depth": [
+      2.3,
+      3.286,
+      1.0,
+      1.0
+    ],
+    "std_depth": [
+      0.675,
+      1.113,
+      0.0,
+      0.0
+    ],
+    "max_depth": [
+      3,
+      4,
+      1,
+      1
+    ],
+    "n_steps_evaluated": [
+      10,
+      7,
+      1,
+      1
+    ]
+  },
   "eps_opt": 0.05,
   "k_chaotic": 2.5,
   "k_regular": 0.5,
