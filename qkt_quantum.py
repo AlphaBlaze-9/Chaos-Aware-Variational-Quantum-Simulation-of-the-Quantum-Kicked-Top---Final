@@ -2,16 +2,19 @@
 qkt_quantum.py -- Floquet operator and related quantum machinery.
 
 CHANGES FROM ORIGINAL:
-  Appendix A / reviewer items (P7, C6):
+  Added two diagnostic/validation routines used in the appendices:
     - branch_validity_check(): verifies the principal-branch matrix
       logarithm is well-defined by computing min|arg(lambda) - pi| across
       k in [0.5, 4.0], and element-wise validates e^{-i H_eff} = U_F.
+      Supports the branch-validity appendix.
     - pauli_decompose_heff(): decomposes H_eff in the Pauli basis and
       reports the fraction of operator norm from YZ vs ZZ interactions.
-      Used to assess the ADAPT-VQA operator-pool confound (reviewer item
-      xii) and to support the J_z^2 all-to-all ZZ content claim.
+      Used to check whether the ADAPT-VQA operator pool (which includes
+      nearest-neighbor YZ terms the layer-wise ansatz lacks) confounds
+      the CNOT-count comparison, and to support the J_z^2 all-to-all ZZ
+      content claim.
 
-  All existing functions are UNCHANGED.
+  All existing functions are unchanged.
 
   [PATCH] Added `floquet_U` as a backward-compatible alias for
   `floquet_U_exact`, since otoc.py, loschmidt.py, and main.py all still
@@ -102,7 +105,7 @@ def husimi_Q_grid(psi: np.ndarray, N: int, thetas, phis) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# NEW: Appendix A -- branch-validity verification (reviewer P7, C6)
+# Branch-validity verification (supports the branch-validity appendix)
 # ---------------------------------------------------------------------------
 
 def branch_validity_check(N: int, k_values=None, p: float = np.pi / 2,
@@ -157,7 +160,7 @@ def branch_validity_check(N: int, k_values=None, p: float = np.pi / 2,
             print(f"  k={k_values[idx]:.1f}: gap={min_gaps[idx]:.4f} rad, "
                   f"max element error={max_errs[idx]:.2e}")
 
-        print("\n>>> FOR APPENDIX A (manuscript):")
+        print("\n>>> Summary for the branch-validity appendix:")
         print(f"  min spectral gap = {min_gaps.min():.4f} rad "
               f"(well away from 0, branch is valid)")
         print(f"  max element-wise |e^(-iH_eff) - U_F| = {max_errs.max():.2e}")
@@ -168,7 +171,7 @@ def branch_validity_check(N: int, k_values=None, p: float = np.pi / 2,
 
 
 # ---------------------------------------------------------------------------
-# NEW: Pauli decomposition of H_eff (reviewer item xii, M7)
+# Pauli decomposition of H_eff (supports the ADAPT-VQA operator-pool check)
 # ---------------------------------------------------------------------------
 
 def _pauli_basis_1q():
@@ -186,14 +189,20 @@ def pauli_decompose_heff(N: int, k: float, p: float = np.pi / 2,
 
     Reports the fraction of the Frobenius norm coming from:
       - ZZ nearest-neighbour terms (the ansatz has these)
-      - ZZ all-to-all terms (the ansatz has only NN)
-      - YZ nearest-neighbour terms (ADAPT-VQA pool includes these)
+      - ZZ all-to-all terms (the ansatz has only the NN subset)
+      - YZ nearest-neighbour terms (the ADAPT-VQA operator pool includes
+        these, but the layer-wise ansatz used in the main text does not)
       - everything else
 
     Returns dict with norm fractions.
 
-    This directly addresses reviewer M7 (whether YZ is significant in H_eff,
-    which would confound the ADAPT-VQA comparison).
+    Purpose: the ADAPT-VQA comparison in the appendix benchmarks CNOT
+    count against a layer-wise ansatz restricted to {Rz, Rx, ZZ_{i,i+1}}.
+    ADAPT-VQA's operator pool additionally includes nearest-neighbor YZ
+    terms, so before treating the CNOT-count comparison as meaningful we
+    need to check whether H_eff actually has non-negligible YZ content --
+    if it did, ADAPT-VQA would have access to operators the layer-wise
+    ansatz structurally cannot represent, confounding the comparison.
     """
     from itertools import product as iproduct
 
@@ -264,7 +273,7 @@ def pauli_decompose_heff(N: int, k: float, p: float = np.pi / 2,
         print(f"  All-to-all ZZ fraction: {frac_all_zz*100:.2f}%  (ansatz has only NN subset)")
         print(f"  NN YZ fraction:         {frac_nn_yz*100:.2f}%  (ADAPT-VQA pool includes these)")
         print(f"  Other fraction:         {frac_other*100:.2f}%")
-        print(f"\n>>> FOR PAPER (Appendix B ADAPT-VQA comparison):")
+        print(f"\n>>> Summary for the ADAPT-VQA comparison appendix:")
         if frac_nn_yz < 0.01:
             print(f"  YZ content < 1% -> pool difference is negligible.")
             print(f"  The ADAPT-VQA CNOT comparison is not materially confounded.")
@@ -283,7 +292,7 @@ def pauli_decompose_heff(N: int, k: float, p: float = np.pi / 2,
 
 
 # ---------------------------------------------------------------------------
-# [PATCH] Backward-compatible alias
+# Backward-compatible alias
 #
 # otoc.py, loschmidt.py, and main.py all still call `floquet_U(N, k, p)`.
 # This is the exact same function as floquet_U_exact -- same signature,
@@ -298,25 +307,25 @@ floquet_U = floquet_U_exact
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # Original Trotter-error tests
+    # Trotter-error sanity checks
     for N in (4, 6):
         for k in (0.5, 2.5):
             err = trotter_error(N, k, np.pi / 2, n_trotter=1)
             print(f"N={N} k={k}: ||U_trotter(n=1) - U_exact|| = {err:.2e}")
 
-    # NEW: Branch validity check
+    # Branch validity check
     print("\n" + "="*60)
-    print("Branch validity check (Appendix A)")
+    print("Branch validity check")
     print("="*60)
     branch_validity_check(N=6, k_values=np.linspace(0.5, 4.0, 36))
 
-    # NEW: Pauli decomposition at k=0.5 and k=2.5
+    # Pauli decomposition at k=0.5 and k=2.5
     print("\n" + "="*60)
-    print("Pauli decomposition of H_eff (reviewer item xii)")
+    print("Pauli decomposition of H_eff (ADAPT-VQA operator-pool check)")
     print("="*60)
     for k in (0.5, 2.5):
         pauli_decompose_heff(N=6, k=k)
 
     print("\nAll qkt_quantum checks complete.")
-    print("New outputs feed directly into Appendix A (branch validity)")
-    print("and Appendix B (ADAPT-VQA pool confound).")
+    print("Outputs feed directly into the branch-validity appendix")
+    print("and the ADAPT-VQA operator-pool comparison appendix.")
