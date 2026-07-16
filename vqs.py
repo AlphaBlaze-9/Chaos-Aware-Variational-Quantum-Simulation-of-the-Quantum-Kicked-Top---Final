@@ -155,7 +155,7 @@ def floquet_step_generator(N: int, k: float, p: float) -> np.ndarray:
 #
 # Do NOT pass --vqs or --vqs-floquet to main.py -- you'll just hit the
 # NotImplementedError below, by design. All real VQS results (Figs. 7, 8,
-# 13) come from adaptive_vqs_qkt.py, which is fully implemented and uses
+# 12) come from adaptive_vqs_qkt.py, which is fully implemented and uses
 # the real McLachlan residual trigger (mclachlan_residual_sq above).
 # ---------------------------------------------------------------------------
 
@@ -163,7 +163,7 @@ def vqs_compare_depths(*args, **kwargs):
     raise NotImplementedError(
         "vqs_compare_depths was never implemented in this repo. "
         "Use adaptive_vqs_qkt.py for real VQS depth-comparison results "
-        "(Figs. 7, 8, 13 in the paper)."
+        "(Figs. 7, 8, 12 in the paper)."
     )
 
 
@@ -171,7 +171,7 @@ def vqs_floquet_two_k(*args, **kwargs):
     raise NotImplementedError(
         "vqs_floquet_two_k was never implemented in this repo. "
         "Use adaptive_vqs_qkt.py for real VQS Floquet results "
-        "(Figs. 7, 8, 13 in the paper)."
+        "(Figs. 7, 8, 12 in the paper)."
     )
 
 
