@@ -43,14 +43,31 @@ policy, etc.) is UNCHANGED from the corrected original.
 """
 
 import os
+# [PERF] Must be set BEFORE numpy is imported, and before any worker process
+# touches numpy, or each of the N_WORKERS processes below will itself try to
+# spawn multiple BLAS threads -- on a 6-core machine this oversubscription
+# (6 processes x however many BLAS threads each) typically makes parallel
+# execution SLOWER than serial, not faster. This is the single most common
+# way to sabotage a multiprocessing + numpy speedup.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
 import time
 import json
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import minimize
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from vqs import Ansatz
 from spin_operators import coherent_product_state, normalize
 from qkt_quantum import floquet_U_exact
+
+# [PERF] Number of parallel worker processes for the restart loop. Defaults
+# to physical core count; override if you want to leave a core free for
+# foreground work while this runs. On the i5-9600K (6 physical cores, no
+# hyperthreading) os.cpu_count() correctly returns 6.
+N_WORKERS = int(os.environ.get("SCALING_N_WORKERS", os.cpu_count() or 4))
 
 # ── Hyper-parameters ────────────────────────────────────────────────────────
 EPS_OPT        = 0.05
@@ -144,39 +161,98 @@ def _save_checkpoint(cache):
 
 # ── Core search ─────────────────────────────────────────────────────────────
 
+def _run_one_restart(args):
+    """[PERF] Module-level (hence picklable) worker for a single restart --
+    runs in its own process. Reconstructs Ansatz(N, D) locally rather than
+    pickling/sending an existing instance, to sidestep any non-picklable
+    cached state inside Ansatz; this reconstruction cost is negligible next
+    to the optimization itself. Returns (r, infidelity, success) -- the
+    infidelity is returned too (not just success) in case you later want to
+    log/report success fractions the way Appendix C already does for the
+    Dmax sweep in plot_dmax_vs_k.py.
+    """
+    N, D, t, r, psi_t, psi0, fid_target, maxiter = args
+    ans = Ansatz(N, D)
+
+    def cost(th):
+        return 1.0 - abs(np.vdot(psi_t, ans.state(th, psi0))) ** 2
+
+    rng = np.random.default_rng((N, t, D, r))
+    x0 = rng.uniform(0, 2 * np.pi, ans.n_params)
+    res = minimize(cost, x0, method="L-BFGS-B", options={"maxiter": maxiter})
+    success = (1.0 - res.fun) >= fid_target
+    return r, float(res.fun), bool(success)
+
+
 def min_sufficient_depth(N, k, psi0, U_F, t, fid_target, max_depth, n_restarts,
-                         time_budget_s=None, t_start=None):
+                         time_budget_s=None, t_start=None,
+                         executor=None, n_workers=None):
     """[PATCH] time_budget_s/t_start: if given, checked before every new
-    depth and after every restart, not just between t's. Without this, a
-    single non-converging t (e.g. deep in a high-N search) can run
+    depth and after every restart batch, not just between t's. Without this,
+    a single non-converging t (e.g. deep in a high-N search) can run
     unbounded, since the caller's between-t check never gets a chance to
     fire until this whole function returns. Returns (D, converged, timed_out).
+
+    [PERF] The restart loop is now dispatched in parallel batches of size
+    n_workers (default N_WORKERS, i.e. os.cpu_count()) via a
+    ProcessPoolExecutor, instead of one restart at a time on a single core.
+    Batches (rather than firing all n_restarts at once) let this still
+    short-circuit as soon as ANY restart in a completed batch succeeds,
+    preserving most of the early-exit benefit the original serial loop had
+    -- at most n_workers-1 "wasted" restarts finish in the background after
+    a success is found, which is negligible next to the compute saved.
+
+    NOTE: because only "was D sufficient" is returned (not which restart
+    index proved it), this is exactly equivalent to the original serial
+    semantics for every quantity actually used downstream (depth_stats,
+    the figure, the confound check) -- it does NOT change which restart
+    happens to be credited with success, only how fast we find out.
+
+    Pass an existing `executor` to reuse one pool across many calls
+    (STRONGLY recommended -- spawning a new process pool per depth/timestep
+    is itself expensive). If none is given, one is created and torn down
+    locally, which is safe but slower if called many times in a loop.
     """
+    n_workers = n_workers or N_WORKERS
     psi_t = psi0.copy()
     for _ in range(t):
         psi_t = normalize(U_F @ psi_t)
 
-    for D in range(1, max_depth + 1):
-        if time_budget_s is not None and t_start is not None:
-            if time.time() - t_start > time_budget_s:
-                return D, False, True
+    owns_executor = executor is None
+    if owns_executor:
+        executor = ProcessPoolExecutor(max_workers=n_workers)
 
-        ans = Ansatz(N, D)
-
-        def cost(th):
-            return 1.0 - abs(np.vdot(psi_t, ans.state(th, psi0))) ** 2
-
-        for r in range(n_restarts):
-            rng = np.random.default_rng((N, t, D, r))
-            x0  = rng.uniform(0, 2 * np.pi, ans.n_params)
-            res = minimize(cost, x0, method="L-BFGS-B",
-                           options={"maxiter": MAXITER})
-            if 1.0 - res.fun >= fid_target:
-                return D, True, False
-
+    try:
+        for D in range(1, max_depth + 1):
             if time_budget_s is not None and t_start is not None:
                 if time.time() - t_start > time_budget_s:
                     return D, False, True
+
+            for batch_start in range(0, n_restarts, n_workers):
+                batch = range(batch_start, min(batch_start + n_workers, n_restarts))
+                futures = {
+                    executor.submit(_run_one_restart,
+                                     (N, D, t, r, psi_t, psi0, fid_target, MAXITER)): r
+                    for r in batch
+                }
+                found = False
+                for fut in as_completed(futures):
+                    r, infidelity, success = fut.result()
+                    if success:
+                        found = True
+                        break  # remaining futures in this batch keep
+                                # running in the background; their results
+                                # are simply discarded when this function
+                                # returns -- see NOTE above.
+                if found:
+                    return D, True, False
+
+                if time_budget_s is not None and t_start is not None:
+                    if time.time() - t_start > time_budget_s:
+                        return D, False, True
+    finally:
+        if owns_executor:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     return max_depth, False, False
 
@@ -186,8 +262,15 @@ def depth_stats(N, k,
                 eps_opt     = EPS_OPT,
                 ceiling_offset = CEILING_OFFSET,
                 n_restarts  = N_RESTARTS,
-                time_budget_s = None):
-
+                time_budget_s = None,
+                executor    = None):
+    """[PERF] Accepts an optional shared `executor` (ProcessPoolExecutor),
+    passed straight through to min_sufficient_depth for every t. Creating a
+    process pool has real overhead (process spawn/fork), so reusing one
+    pool across all ~10 timesteps in this function -- and ideally across
+    all (N,k) pairs in main() -- matters much more than it would for a
+    single call.
+    """
     if time_budget_s is None:
         time_budget_s = TIME_BUDGET_TABLE.get(N, TIME_BUDGET_DEFAULT)
 
@@ -210,7 +293,7 @@ def depth_stats(N, k,
 
         D, conv, timed_out = min_sufficient_depth(
             N, k, psi0, U_F, t, fid_target, max_depth, n_restarts,
-            time_budget_s=time_budget_s, t_start=t_start)
+            time_budget_s=time_budget_s, t_start=t_start, executor=executor)
         if timed_out:
             print(f"  N={N} k={k} t={t:2d}: time budget ({time_budget_s:.0f} s) "
                   f"reached mid-search at D={D}; discarding this partial "
@@ -416,6 +499,29 @@ def main():
 
     os.makedirs("figures", exist_ok=True)
 
+    # [PERF] One process pool for the ENTIRE run, reused across every
+    # (N, k) pair and every timestep within it. Spawning a fresh pool per
+    # depth_stats() call (or worse, per timestep) would waste most of the
+    # parallelization benefit on process-startup overhead instead of on
+    # your actual restarts. With N_WORKERS=6 physical cores and
+    # OMP/OPENBLAS/MKL_NUM_THREADS pinned to 1 (top of file), this should
+    # not oversubscribe the CPU.
+    print(f"[PERF] Starting shared process pool with N_WORKERS={N_WORKERS} "
+          f"(override via SCALING_N_WORKERS env var).", flush=True)
+    _executor = ProcessPoolExecutor(max_workers=N_WORKERS)
+    try:
+        _main_body(system_sizes, checkpoint, mean_cha, std_cha, max_cha,
+                   mean_reg, std_reg, max_reg, neval_cha, neval_reg,
+                   mean_reg2, std_reg2, max_reg2, neval_reg2, _executor)
+    finally:
+        _executor.shutdown(wait=True)
+        print("[PERF] Process pool shut down cleanly.", flush=True)
+
+
+def _main_body(system_sizes, checkpoint, mean_cha, std_cha, max_cha,
+               mean_reg, std_reg, max_reg, neval_cha, neval_reg,
+               mean_reg2, std_reg2, max_reg2, neval_reg2, executor):
+
     valid_sizes = []
     for N in system_sizes:
         print(f"\n{'='*55}")
@@ -427,7 +533,7 @@ def main():
                   f"-- n_restarts={N_RESTARTS} matches saved config]")
         else:
             try:
-                m, s, mx, ne, conv = depth_stats(N, K_CHAOTIC)
+                m, s, mx, ne, conv = depth_stats(N, K_CHAOTIC, executor=executor)
             except MemoryError:
                 print(f"  N={N} chaotic: MemoryError — skipping N={N}.", flush=True)
                 if N == 10:
@@ -449,7 +555,7 @@ def main():
                   f"-- n_restarts={N_RESTARTS} matches saved config]")
         else:
             try:
-                m, s, mx, ne, conv = depth_stats(N, K_REGULAR)
+                m, s, mx, ne, conv = depth_stats(N, K_REGULAR, executor=executor)
             except MemoryError:
                 print(f"  N={N} regular: MemoryError — using placeholder.", flush=True)
                 m, s, mx, ne, conv = (mean_reg[-1] if mean_reg else 1.0), 0.0, 1, 0, False
@@ -473,7 +579,7 @@ def main():
                       f"-- n_restarts={N_RESTARTS} matches saved config]")
             else:
                 try:
-                    m2, s2, mx2, ne2, conv2 = depth_stats(N, K_REGULAR_ALT)
+                    m2, s2, mx2, ne2, conv2 = depth_stats(N, K_REGULAR_ALT, executor=executor)
                 except MemoryError:
                     print(f"  N={N} regular-alt: MemoryError — using placeholder.", flush=True)
                     m2, s2, mx2, ne2, conv2 = (mean_reg2[-1] if mean_reg2 else 1.0), 0.0, 1, 0, False
