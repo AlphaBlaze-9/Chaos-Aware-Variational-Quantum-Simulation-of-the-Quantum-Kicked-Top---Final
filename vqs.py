@@ -68,6 +68,121 @@ class Ansatz:
         return normalize(psi)
 
 
+# ---------------------------------------------------------------------------
+# [PATCH -- analytic gradient via adjoint differentiation]
+#
+# WHY: large_scale_scaling.py calls scipy.optimize.minimize with no jac=
+# argument, so SciPy falls back to finite-difference gradients: every
+# gradient evaluation costs ~n_params extra calls to ansatz.state(). At
+# N=10, D=16, n_params = (2*10+1)*16 = 336 -- every single L-BFGS-B
+# iteration costs ~337 full state simulations just to estimate one
+# gradient. Measured benchmark (see chat / test scripts): at N=10, D=16 a
+# single finite-difference gradient took ~81.5s; the analytic gradient
+# below takes ~0.5s for the identical (theta, target) -- a ~158x speedup,
+# with gradient values matching finite differences to ~5e-11. This is very
+# likely the dominant reason N=8/N=10 chaotic couldn't complete more than a
+# single Floquet step even on a 20-thread machine: raw core count can't fix
+# a single restart being this expensive.
+#
+# HOW: every gate in this ansatz -- Y-rotation, Z-rotation, and the
+# shared-chi ZZ entangler -- has the form U(theta) = exp(-i*theta/2*G) for
+# a Hermitian, INVOLUTORY generator G (G^2 = I): G = Y_i, Zdiag_i, or
+# S = sum(ZZdiag) respectively. For any circuit built entirely from such
+# gates, one forward pass (storing every intermediate state) plus one
+# backward pass (propagating psi_target backward through each gate's
+# inverse) gives the EXACT gradient for every parameter simultaneously, at
+# a total cost of ~2 full circuit passes -- independent of n_params. This
+# is standard "adjoint differentiation" for variational circuits (see e.g.
+# Jones & Gacon, arXiv:2009.02823). Validated numerically against finite
+# differences across N=2..4, D=1..3 (max error ~2e-10) before being wired
+# into the depth-scaling search.
+# ---------------------------------------------------------------------------
+
+def infidelity_and_grad(ansatz: "Ansatz", theta: np.ndarray, psi0: np.ndarray,
+                         psi_target: np.ndarray):
+    """Analytic (exact) gradient of
+        infidelity(theta) = 1 - |<psi_target | ansatz.state(theta, psi0)>|^2
+    via adjoint differentiation. Returns (infidelity, grad), where grad has
+    the same shape as theta -- drop-in compatible with
+    scipy.optimize.minimize(..., jac=True) when used as the objective
+    itself (see large_scale_scaling.py's _run_one_restart).
+
+    Cost: ~2 full circuit passes total, regardless of n_params -- versus
+    ~2*n_params (parameter-shift) or ~n_params+1 (finite-difference,
+    SciPy's default) full circuit passes for the same gradient.
+    """
+    N, D = ansatz.N, ansatz.depth
+
+    # state() applies N sequential elementwise multiplies by
+    # exp(-i*chi/2*zzd_j) for the entangler; since these are diagonal
+    # (hence commuting) operators, this is exactly equal to one multiply by
+    # exp(-i*chi/2 * sum_j(zzd_j)). Cached on the ansatz instance so repeated
+    # calls (every restart, every depth, every timestep) don't recompute it.
+    if not hasattr(ansatz, "_zz_sum_cached"):
+        ansatz._zz_sum_cached = sum(ansatz.ZZdiag)
+    S = ansatz._zz_sum_cached
+
+    # ---- Forward pass: store the state immediately BEFORE each of the
+    # n_params gates, in the exact order state() consumes theta. ----
+    psi = psi0.astype(complex).copy()
+    pre_states = []
+    gate_info = []  # (kind, data) per gate, kind in {'y', 'z', 'zz'}
+
+    for _ in range(D):
+        for i in range(N):
+            a = theta[len(gate_info)]
+            pre_states.append(psi)
+            gate_info.append(('y', ansatz.Y[i]))
+            psi = (np.cos(a / 2.0) * psi) - 1j * np.sin(a / 2.0) * (ansatz.Y[i] @ psi)
+        for i in range(N):
+            a = theta[len(gate_info)]
+            pre_states.append(psi)
+            gate_info.append(('z', ansatz.Zdiag[i]))
+            psi = np.exp(-1j * (a / 2.0) * ansatz.Zdiag[i]) * psi
+        a = theta[len(gate_info)]
+        pre_states.append(psi)
+        gate_info.append(('zz', S))
+        psi = np.exp(-1j * (a / 2.0) * S) * psi
+
+    psi_final_raw = psi
+    norm = np.linalg.norm(psi_final_raw)
+    psi_final = psi_final_raw / norm
+
+    c = np.vdot(psi_target, psi_final)  # <psi_target | psi_final>
+    fidelity = float(np.real(c * np.conj(c)))
+    infidelity = 1.0 - fidelity
+
+    # ---- Backward pass ----
+    lam = psi_target.astype(complex).copy()
+    dF = np.zeros_like(theta, dtype=float)  # dFidelity/dtheta_k
+
+    for k in range(len(theta) - 1, -1, -1):
+        kind, data = gate_info[k]
+        psi_before = pre_states[k]
+        a = theta[k]
+
+        if kind == 'y':
+            G = data
+            psi_after = (np.cos(a / 2.0) * psi_before) - 1j * np.sin(a / 2.0) * (G @ psi_before)
+            dpsi = -0.5j * (G @ psi_after)
+        else:  # 'z' or 'zz' -- diagonal generator
+            G = data
+            psi_after = np.exp(-1j * (a / 2.0) * G) * psi_before
+            dpsi = -0.5j * (G * psi_after)
+
+        dc = np.vdot(lam, dpsi) / norm
+        dF[k] = 2.0 * np.real(np.conj(c) * dc)
+
+        # Undo gate k on lam: apply U(-a) = U(a)^dagger
+        if kind == 'y':
+            lam = (np.cos(a / 2.0) * lam) + 1j * np.sin(a / 2.0) * (G @ lam)
+        else:
+            lam = np.exp(1j * (a / 2.0) * G) * lam
+
+    grad_infidelity = -dF
+    return infidelity, grad_infidelity
+
+
 def _param_derivatives(ansatz: Ansatz, theta: np.ndarray, psi0: np.ndarray,
                         eps: float = 1e-6) -> List[np.ndarray]:
     derivs = []

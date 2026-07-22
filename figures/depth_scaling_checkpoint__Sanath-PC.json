@@ -1,0 +1,132 @@
+{
+  "global_config": {
+    "eps_opt": 0.05,
+    "n_steps": 10,
+    "n_restarts": 50,
+    "machine": "Sanath-PC",
+    "cpu": "Intel64_Family_6_Model_198_Stepping_2,_G",
+    "gradient_method": "analytic_adjoint"
+  },
+  "results": {
+    "4,2.5": {
+      "ceiling_offset": 12,
+      "value": [
+        2.4,
+        0.6992058987801011,
+        3,
+        10,
+        true
+      ]
+    },
+    "4,0.5": {
+      "ceiling_offset": 12,
+      "value": [
+        1.7,
+        0.6749485577105528,
+        3,
+        10,
+        true
+      ]
+    },
+    "4,1.5": {
+      "ceiling_offset": 12,
+      "value": [
+        2.3,
+        0.6749485577105528,
+        3,
+        10,
+        true
+      ]
+    },
+    "6,2.5": {
+      "ceiling_offset": 12,
+      "value": [
+        4.0,
+        0.4714045207910317,
+        5,
+        10,
+        true
+      ]
+    },
+    "6,0.5": {
+      "ceiling_offset": 12,
+      "value": [
+        2.6,
+        1.2649110640673518,
+        4,
+        10,
+        true
+      ]
+    },
+    "6,1.5": {
+      "ceiling_offset": 12,
+      "value": [
+        3.6,
+        1.07496769977314,
+        5,
+        10,
+        true
+      ]
+    },
+    "8,2.5": {
+      "ceiling_offset": 12,
+      "value": [
+        11.9,
+        3.414023367751831,
+        18,
+        10,
+        true
+      ]
+    },
+    "8,0.5": {
+      "ceiling_offset": 12,
+      "value": [
+        4.8,
+        2.8982753492378874,
+        9,
+        10,
+        true
+      ]
+    },
+    "8,1.5": {
+      "ceiling_offset": 12,
+      "value": [
+        10.2,
+        4.962078417580905,
+        17,
+        10,
+        true
+      ]
+    },
+    "10,2.5": {
+      "ceiling_offset": 30,
+      "value": [
+        14.5,
+        4.949747468305833,
+        18,
+        2,
+        true
+      ]
+    },
+    "10,0.5": {
+      "ceiling_offset": 30,
+      "value": [
+        7.8,
+        5.245103536738918,
+        16,
+        10,
+        true
+      ]
+    },
+    "10,1.5": {
+      "ceiling_offset": 30,
+      "value": [
+        9.75,
+        6.946221994724902,
+        18,
+        4,
+        true
+      ]
+    }
+  }
+}

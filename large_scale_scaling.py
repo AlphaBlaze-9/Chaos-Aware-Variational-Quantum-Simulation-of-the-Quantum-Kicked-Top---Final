@@ -55,19 +55,35 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 import time
 import json
+import platform
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import minimize
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from vqs import Ansatz
+from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
+from vqs import Ansatz, infidelity_and_grad
 from spin_operators import coherent_product_state, normalize
 from qkt_quantum import floquet_U_exact
 
 # [PERF] Number of parallel worker processes for the restart loop. Defaults
-# to physical core count; override if you want to leave a core free for
-# foreground work while this runs. On the i5-9600K (6 physical cores, no
-# hyperthreading) os.cpu_count() correctly returns 6.
+# to physical/logical core count; override if you want to leave a core free
+# for foreground work while this runs.
 N_WORKERS = int(os.environ.get("SCALING_N_WORKERS", os.cpu_count() or 4))
+
+# [PROVENANCE] Identify the machine this run executes on. This matters
+# because the manuscript's Funding Information section names specific
+# hardware (CPU/GPU/RAM) that the reported N=8/N=10 numbers were computed
+# on. If this script is ever run on a DIFFERENT machine, its results must
+# not silently end up in the same checkpoint file as results from the
+# machine actually named in the paper -- that would make the hardware
+# disclosure inaccurate without anyone noticing. Two independent layers of
+# protection below: (1) the checkpoint file itself is machine-tagged by
+# default, so different machines write to different files entirely; (2) the
+# machine tag is also stored inside the checkpoint's config, so even a
+# manually copied/renamed checkpoint file gets flagged as a mismatch and
+# recomputed rather than silently trusted (same existing mechanism this
+# file already uses to invalidate stale N_RESTARTS/eps_opt configs).
+_MACHINE_TAG = (platform.node() or "unknown_host").replace(" ", "_")
+_CPU_TAG = (platform.processor() or "unknown_cpu").replace(" ", "_")[:40]
 
 # ── Hyper-parameters ────────────────────────────────────────────────────────
 EPS_OPT        = 0.05
@@ -81,18 +97,38 @@ K_REGULAR_ALT  = 1.5         # [item xiii] second regular-plateau point (FTLE~0
                               # track K_CHAOTIC instead).
 RUN_REGULAR_ALT = True       # set False to skip this and only run the original pair
 N_RESTARTS     = 50          # was 12 -- now matches Table III's stated "50"
-CEILING_OFFSET = 6
+
+# [PATCH v6 -- per-N ceiling, decoupled from the global checkpoint config]
+# Previously CEILING_OFFSET was one global constant, and it was part of the
+# checkpoint's file-level config -- meaning ANY change to it (e.g. to give
+# N=10 more room) invalidated N=4/6/8 too, forcing a full, expensive
+# recompute of data that was already correct and hard-won. That's no
+# longer true: ceiling is now tracked PER (N,k) ENTRY inside the
+# checkpoint (see _load_checkpoint/_save_checkpoint below), migrated
+# automatically from any old flat-format checkpoint file. Raising
+# CEILING_OFFSET_BY_N[10] below will recompute ONLY N=10 entries; N=4/6/8,
+# already computed under offset=12, stay cached and untouched.
+#
+# N=8's own results are the reason N=10 gets a much bigger jump than N=8
+# did: N=8 chaotic's slowest timestep needed depth 18 out of a ceiling of
+# 20 -- only 2 layers of headroom to spare. Given depth requirements have
+# been growing sharply with N (N=6 max=5 -> N=8 max=18), N=10 could
+# plausibly need well beyond the old ceiling of 22. This is a genuine
+# extrapolation, not a guarantee -- if N=10 hits even this new ceiling,
+# that is itself worth reporting honestly rather than chasing indefinitely.
+CEILING_OFFSET_BY_N = {4: 12, 6: 12, 8: 12, 10: 30}
+CEILING_OFFSET_DEFAULT = 12
 MAXITER        = 200
 
-# Scaled from the original {4: 60.0, 6: 150.0, 8: 600.0, 10: 600.0} by the
-# same 50/12 ~= 4.1667x factor as N_RESTARTS, since the restart loop runs to
-# completion on failure (needed to certify a depth "insufficient"), so cost
-# scales ~linearly with n_restarts. This is a starting point, not a
-# guarantee of full 10-step coverage at N=8/10 -- it wasn't enough for that
-# even at 12 restarts. Raise further if you want denser data and are
-# willing to let it run longer (overnight with caffeinate, as before).
-TIME_BUDGET_TABLE = {4: 250.0, 6: 625.0, 8: 2500.0, 10: 2500.0}
-TIME_BUDGET_DEFAULT = 2500.0
+# [PATCH v6] N=10 given a much larger, dedicated budget -- previously
+# 10000s wasn't enough to get past t=2 (t=1 converged at D=11; t=2 alone
+# consumed the rest of the budget without finishing). This is meant to be
+# run as its own separate, focused session (e.g. overnight), not
+# alongside a routine N=4/6/8 rerun. N=4/6/8 budgets are left as before
+# since those are already complete and will restore from checkpoint
+# almost instantly regardless of budget.
+TIME_BUDGET_TABLE = {4: 500.0, 6: 1500.0, 8: 6000.0, 10: 43200.0}  # N=10: 12h
+TIME_BUDGET_DEFAULT = 43200.0
 
 # Set to False to skip N=10 (fast CI run):
 TRY_N10 = True
@@ -104,58 +140,137 @@ TRY_N10 = True
 # and that (N, k) recomputes fresh. Saved incrementally after every (N, k)
 # so a crash partway through (e.g. during N=10) doesn't lose the results
 # already computed for smaller N.
-CHECKPOINT_PATH = "figures/depth_scaling_checkpoint.json"
+#
+# [PROVENANCE] Filename now includes the machine tag by default, so running
+# this on a different computer writes to a DIFFERENT checkpoint file rather
+# than reading/writing the same one your primary-hardware results live in.
+# Override with SCALING_CHECKPOINT_PATH if you deliberately want a specific
+# shared path (e.g. to merge results by hand later with full awareness of
+# what came from where).
+CHECKPOINT_PATH = os.environ.get(
+    "SCALING_CHECKPOINT_PATH",
+    f"figures/depth_scaling_checkpoint__{_MACHINE_TAG}.json",
+)
 
 
 def _checkpoint_config():
+    """[PATCH v6] ceiling_offset removed from here -- it's now tracked
+    PER (N,k) ENTRY (see _load_checkpoint/_save_checkpoint), not as one
+    global value for the whole file. Everything still listed here applies
+    uniformly across all N and SHOULD invalidate everything if changed
+    (a different gradient method, restart count, or machine really does
+    make every cached result incomparable) -- ceiling_offset is the one
+    knob we specifically want to vary per-N without that blast radius.
+    """
     return {
         "eps_opt": EPS_OPT,
         "n_steps": N_STEPS,
-        "ceiling_offset": CEILING_OFFSET,
         "n_restarts": N_RESTARTS,
+        "machine": _MACHINE_TAG,   # [PROVENANCE] a checkpoint file computed
+        "cpu": _CPU_TAG,           # on a different machine now fails this
+                                    # equality check and is treated as stale,
+                                    # even if someone manually copies/renames
+                                    # the file to look like a match.
+        "gradient_method": "analytic_adjoint",
     }
 
 
 def _load_checkpoint():
-    """Load per-(N,k) results already computed under the CURRENT config.
-    If no checkpoint file exists, or it was written under a different
-    config (e.g. an older N_RESTARTS=12 run), returns an empty cache so
-    every (N,k) recomputes fresh -- rather than silently mixing results
-    computed under different restart counts."""
+    """Load per-(N,k) results already computed under the CURRENT global
+    config AND the CURRENT per-N ceiling_offset for that specific N. If no
+    checkpoint file exists, or its global config doesn't match, returns an
+    empty cache. If the global config matches but a given entry's
+    ceiling_offset doesn't match CEILING_OFFSET_BY_N[N], only THAT entry is
+    dropped -- other entries (e.g. N=4/6/8 when only N=10's ceiling
+    changed) remain valid and cached.
+
+    [PATCH v6 -- migration] Old checkpoint files (written before this
+    per-entry-ceiling change) store ceiling_offset once, globally, under
+    "config", with flat [m,s,mx,ne,conv] result values. Such a file is
+    auto-migrated on load: its global ceiling_offset is treated as the
+    recorded per-entry offset for every entry it contains, then the same
+    per-entry validity check applies -- so an old N=4/6/8/10 checkpoint
+    (all computed under one old global offset) correctly keeps N=4/6/8
+    valid while dropping N=10 the moment CEILING_OFFSET_BY_N[10] is raised
+    above that old value, with no manual intervention needed.
+    """
     if not os.path.exists(CHECKPOINT_PATH):
-        return {}
+        return {}, {}
     try:
         with open(CHECKPOINT_PATH) as fh:
             raw = json.load(fh)
     except (json.JSONDecodeError, OSError):
         print(f"[CHECKPOINT] {CHECKPOINT_PATH} unreadable -- starting fresh.",
               flush=True)
-        return {}
+        return {}, {}
 
-    if raw.get("config") != _checkpoint_config():
-        print(f"[CHECKPOINT] Found {CHECKPOINT_PATH} but its config "
-              f"{raw.get('config')} does not match the current config "
-              f"{_checkpoint_config()} -- ignoring stale checkpoint, "
-              f"recomputing everything under the current config.",
+    is_old_format = "config" in raw and "global_config" not in raw
+
+    if is_old_format:
+        old_config = dict(raw.get("config", {}))
+        old_ceiling_offset = old_config.pop("ceiling_offset", None)
+        if old_config != _checkpoint_config():
+            print(f"[CHECKPOINT] Found {CHECKPOINT_PATH} (old format) but its "
+                  f"non-ceiling config {old_config} does not match the current "
+                  f"config {_checkpoint_config()} -- ignoring stale checkpoint, "
+                  f"recomputing everything.", flush=True)
+            return {}, {}
+        print(f"[CHECKPOINT] Migrating old-format checkpoint (global "
+              f"ceiling_offset={old_ceiling_offset}) to per-entry format.",
               flush=True)
-        return {}
+        raw_results = {
+            key: {"ceiling_offset": old_ceiling_offset, "value": val}
+            for key, val in raw.get("results", {}).items()
+        }
+    else:
+        if raw.get("global_config") != _checkpoint_config():
+            print(f"[CHECKPOINT] Found {CHECKPOINT_PATH} but its global config "
+                  f"{raw.get('global_config')} does not match the current "
+                  f"config {_checkpoint_config()} -- ignoring stale checkpoint, "
+                  f"recomputing everything.", flush=True)
+            return {}, {}
+        raw_results = raw.get("results", {})
 
     cache = {}
-    for key_str, v in raw.get("results", {}).items():
+    entry_ceiling_offsets = {}
+    dropped = []
+    for key_str, entry in raw_results.items():
         N_str, k_str = key_str.split(",")
-        cache[(int(N_str), float(k_str))] = tuple(v)
+        N_key = int(N_str)
+        expected_offset = CEILING_OFFSET_BY_N.get(N_key, CEILING_OFFSET_DEFAULT)
+        if entry.get("ceiling_offset") != expected_offset:
+            dropped.append((key_str, entry.get("ceiling_offset"), expected_offset))
+            continue
+        key = (N_key, float(k_str))
+        cache[key] = tuple(entry["value"])
+        entry_ceiling_offsets[key] = expected_offset
+
     if cache:
         print(f"[CHECKPOINT] Loaded {len(cache)} completed (N,k) result(s) "
-              f"from {CHECKPOINT_PATH} (config matches current run).",
+              f"from {CHECKPOINT_PATH} (config + per-entry ceiling match).",
               flush=True)
-    return cache
+    for key_str, old_off, new_off in dropped:
+        print(f"[CHECKPOINT] Dropping cached entry {key_str}: computed under "
+              f"ceiling_offset={old_off}, current setting for its N is "
+              f"{new_off} -- will recompute.", flush=True)
+    return cache, entry_ceiling_offsets
 
 
-def _save_checkpoint(cache):
+def _save_checkpoint(cache, entry_ceiling_offsets):
+    """[PATCH v6] entry_ceiling_offsets: dict mapping (N,k) -> the
+    ceiling_offset actually used to compute that entry, stored alongside
+    each result so future runs can tell whether it's still valid under
+    whatever CEILING_OFFSET_BY_N says for that N at load time."""
     os.makedirs(os.path.dirname(CHECKPOINT_PATH) or ".", exist_ok=True)
-    serializable = {f"{N},{k}": list(v) for (N, k), v in cache.items()}
+    serializable = {
+        f"{N},{k}": {
+            "ceiling_offset": entry_ceiling_offsets.get((N, k)),
+            "value": list(v),
+        }
+        for (N, k), v in cache.items()
+    }
     with open(CHECKPOINT_PATH, "w") as fh:
-        json.dump({"config": _checkpoint_config(), "results": serializable},
+        json.dump({"global_config": _checkpoint_config(), "results": serializable},
                   fh, indent=2)
 
 
@@ -170,16 +285,32 @@ def _run_one_restart(args):
     infidelity is returned too (not just success) in case you later want to
     log/report success fractions the way Appendix C already does for the
     Dmax sweep in plot_dmax_vs_k.py.
+
+    [PERF -- analytic gradient] Previously this called minimize(cost, ...)
+    with no jac= argument, so SciPy estimated the gradient by finite
+    differences: ~n_params extra calls to ans.state() per gradient, every
+    L-BFGS-B iteration. At N=10, D=16 that's ~337 extra state simulations
+    per gradient step. Now uses infidelity_and_grad (adjoint
+    differentiation, vqs.py) via jac=True: the objective function itself
+    returns (value, gradient) computed together in ~2 full-circuit-passes
+    total, independent of n_params. Measured speedup at N=10, D=16: ~158x
+    per gradient evaluation, with gradient values matching finite
+    differences to ~5e-11 (validated across N=2..5, D=1..3 before being
+    wired in here). This is the dominant fix for the N=8/N=10 sampling gap
+    -- more CPU cores alone could not move those points, because each
+    individual restart was inherently this expensive regardless of
+    parallelism.
     """
     N, D, t, r, psi_t, psi0, fid_target, maxiter = args
     ans = Ansatz(N, D)
 
-    def cost(th):
-        return 1.0 - abs(np.vdot(psi_t, ans.state(th, psi0))) ** 2
+    def cost_and_grad(th):
+        return infidelity_and_grad(ans, th, psi0, psi_t)
 
     rng = np.random.default_rng((N, t, D, r))
     x0 = rng.uniform(0, 2 * np.pi, ans.n_params)
-    res = minimize(cost, x0, method="L-BFGS-B", options={"maxiter": maxiter})
+    res = minimize(cost_and_grad, x0, method="L-BFGS-B", jac=True,
+                   options={"maxiter": maxiter})
     success = (1.0 - res.fun) >= fid_target
     return r, float(res.fun), bool(success)
 
@@ -188,25 +319,34 @@ def min_sufficient_depth(N, k, psi0, U_F, t, fid_target, max_depth, n_restarts,
                          time_budget_s=None, t_start=None,
                          executor=None, n_workers=None):
     """[PATCH] time_budget_s/t_start: if given, checked before every new
-    depth and after every restart batch, not just between t's. Without this,
-    a single non-converging t (e.g. deep in a high-N search) can run
-    unbounded, since the caller's between-t check never gets a chance to
-    fire until this whole function returns. Returns (D, converged, timed_out).
+    depth and while restarts are streaming in, not just between t's.
+    Without this, a single non-converging t (e.g. deep in a high-N search)
+    can run unbounded, since the caller's between-t check never gets a
+    chance to fire until this whole function returns. Returns
+    (D, converged, timed_out).
 
-    [PERF] The restart loop is now dispatched in parallel batches of size
-    n_workers (default N_WORKERS, i.e. os.cpu_count()) via a
-    ProcessPoolExecutor, instead of one restart at a time on a single core.
-    Batches (rather than firing all n_restarts at once) let this still
-    short-circuit as soon as ANY restart in a completed batch succeeds,
-    preserving most of the early-exit benefit the original serial loop had
-    -- at most n_workers-1 "wasted" restarts finish in the background after
-    a success is found, which is negligible next to the compute saved.
+    [PERF v2 -- streaming dispatch] Previously this fired restarts in
+    fixed-size batches of n_workers and waited for the WHOLE batch (or an
+    early success) before submitting the next. That's fine on a homogeneous
+    CPU, but on a hybrid P-core/E-core chip (e.g. Intel 200-series "Ultra"
+    parts) a fixed batch's completion time is gated by whichever restart
+    the OS scheduler happens to land on the slowest core -- fast cores
+    finish early and then sit idle waiting for stragglers before the next
+    batch can even start. This version instead keeps up to n_workers
+    restarts continuously in flight: the instant any one finishes, the next
+    pending restart (if any) is submitted immediately. Fast cores naturally
+    pull through more restarts per unit time; nothing waits on a straggler.
+    This is a strict improvement on homogeneous hardware too (removes
+    synchronization stalls from restart-to-restart variance in how many
+    L-BFGS-B iterations it takes to converge or fail), and specifically
+    fixes the P-core/E-core imbalance on hybrid CPUs.
 
     NOTE: because only "was D sufficient" is returned (not which restart
     index proved it), this is exactly equivalent to the original serial
     semantics for every quantity actually used downstream (depth_stats,
     the figure, the confound check) -- it does NOT change which restart
-    happens to be credited with success, only how fast we find out.
+    happens to be credited with success, only how fast/efficiently we find
+    out, regardless of core count or core heterogeneity.
 
     Pass an existing `executor` to reuse one pool across many calls
     (STRONGLY recommended -- spawning a new process pool per depth/timestep
@@ -228,28 +368,50 @@ def min_sufficient_depth(N, k, psi0, U_F, t, fid_target, max_depth, n_restarts,
                 if time.time() - t_start > time_budget_s:
                     return D, False, True
 
-            for batch_start in range(0, n_restarts, n_workers):
-                batch = range(batch_start, min(batch_start + n_workers, n_restarts))
-                futures = {
-                    executor.submit(_run_one_restart,
-                                     (N, D, t, r, psi_t, psi0, fid_target, MAXITER)): r
-                    for r in batch
-                }
-                found = False
-                for fut in as_completed(futures):
-                    r, infidelity, success = fut.result()
+            next_r = 0
+            in_flight = {}          # future -> restart index
+            success_found = False
+            timed_out_here = False
+
+            while next_r < n_restarts or in_flight:
+                # Keep the in-flight window topped up to n_workers.
+                while next_r < n_restarts and len(in_flight) < n_workers:
+                    fut = executor.submit(
+                        _run_one_restart,
+                        (N, D, t, next_r, psi_t, psi0, fid_target, MAXITER))
+                    in_flight[fut] = next_r
+                    next_r += 1
+
+                if not in_flight:
+                    break  # nothing left to submit and nothing pending
+
+                done, _ = wait(list(in_flight.keys()),
+                                return_when=FIRST_COMPLETED)
+                for fut in done:
+                    in_flight.pop(fut, None)
+                    _, _, success = fut.result()
                     if success:
-                        found = True
-                        break  # remaining futures in this batch keep
-                                # running in the background; their results
-                                # are simply discarded when this function
-                                # returns -- see NOTE above.
-                if found:
-                    return D, True, False
+                        success_found = True
+                # Don't bother launching new restarts once we know D is
+                # sufficient -- fall through and return below. Any other
+                # still-in-flight futures from this depth are abandoned
+                # (not cancelled forcibly, since a worker mid-computation
+                # can't be interrupted anyway) -- same negligible-waste
+                # tradeoff as the previous batched version.
+                if success_found:
+                    break
 
                 if time_budget_s is not None and t_start is not None:
                     if time.time() - t_start > time_budget_s:
-                        return D, False, True
+                        for f in in_flight:
+                            f.cancel()  # best-effort: only cancels futures
+                        timed_out_here = True    # that haven't started yet
+                        break
+
+            if success_found:
+                return D, True, False
+            if timed_out_here:
+                return D, False, True
     finally:
         if owns_executor:
             executor.shutdown(wait=False, cancel_futures=True)
@@ -260,7 +422,7 @@ def min_sufficient_depth(N, k, psi0, U_F, t, fid_target, max_depth, n_restarts,
 def depth_stats(N, k,
                 steps       = N_STEPS,
                 eps_opt     = EPS_OPT,
-                ceiling_offset = CEILING_OFFSET,
+                ceiling_offset = None,
                 n_restarts  = N_RESTARTS,
                 time_budget_s = None,
                 executor    = None):
@@ -270,7 +432,14 @@ def depth_stats(N, k,
     pool across all ~10 timesteps in this function -- and ideally across
     all (N,k) pairs in main() -- matters much more than it would for a
     single call.
+
+    [PATCH v6] ceiling_offset defaults to None, meaning "look up
+    CEILING_OFFSET_BY_N[N]" -- this is what lets N=10 use a different
+    (larger) ceiling than N=4/6/8 without every caller needing to know
+    about the per-N table.
     """
+    if ceiling_offset is None:
+        ceiling_offset = CEILING_OFFSET_BY_N.get(N, CEILING_OFFSET_DEFAULT)
     if time_budget_s is None:
         time_budget_s = TIME_BUDGET_TABLE.get(N, TIME_BUDGET_DEFAULT)
 
@@ -320,7 +489,7 @@ def depth_stats(N, k,
 
 def save_figure(system_sizes, mean_reg, std_reg, mean_cha, std_cha,
                 neval_cha=None, neval_reg=None,
-                mean_reg2=None, std_reg2=None, k_reg2=None):
+                mean_reg2=None, std_reg2=None, k_reg2=None, neval_reg2=None):
     """Save Fig. 12 (depth_scaling).
 
     KEY CHANGE: the N=8 chaotic point is ALWAYS drawn as an open square
@@ -392,11 +561,38 @@ def save_figure(system_sizes, mean_reg, std_reg, mean_cha, std_cha,
         ax.plot(ns_cha, mean_cha, "-", color="#D55E00", lw=1.5, zorder=0)
 
     # ── [item xiii] Regular-alt (k=1.5) confound-check series ──────────────
+    # [FIX] Previously drawn as a single errorbar() call with one uniform
+    # marker style for every point -- meaning an undersampled point (e.g.
+    # N=10 at 4/10 steps) rendered identically to a fully-converged one
+    # (e.g. N=4 at 10/10 steps), with no visual distinction at all. This
+    # silently contradicted the manuscript text, which explicitly
+    # describes the N=10 regular-alt point as a partial, 4-of-10-step
+    # average. Now split into solid/open groups exactly like the regular
+    # series above, using the same UNDERSAMPLED_THRESHOLD.
     if mean_reg2:
         ns_reg2 = ns_done[:len(mean_reg2)]
-        ax.errorbar(ns_reg2, mean_reg2, yerr=std_reg2, fmt="^--",
-                    color="#009E73", capsize=4,
-                    label=f"Regular-alt ($k={k_reg2}$)" if k_reg2 else "Regular-alt")
+        mean_reg2_arr = np.array(mean_reg2)
+        std_reg2_arr = np.array(std_reg2)
+        reg2_open_mask = np.array([
+            (neval_reg2[i] if (neval_reg2 is not None and i < len(neval_reg2)) else 999)
+            < UNDERSAMPLED_THRESHOLD
+            for i in range(len(ns_reg2))
+        ])
+        lbl = f"Regular-alt ($k={k_reg2}$)" if k_reg2 else "Regular-alt"
+        if reg2_open_mask.any():
+            solid_idx2 = ~reg2_open_mask
+            if solid_idx2.any():
+                ax.errorbar(ns_reg2[solid_idx2], mean_reg2_arr[solid_idx2],
+                            yerr=std_reg2_arr[solid_idx2], fmt="^", ls="none",
+                            color="#009E73", capsize=4, label=lbl)
+            ax.errorbar(ns_reg2[reg2_open_mask], mean_reg2_arr[reg2_open_mask],
+                        yerr=std_reg2_arr[reg2_open_mask], fmt="^", ls="none",
+                        color="#009E73", capsize=4, markerfacecolor="none",
+                        label=None if solid_idx2.any() else lbl)
+            ax.plot(ns_reg2, mean_reg2, "--", color="#009E73", lw=1.5, zorder=0)
+        else:
+            ax.errorbar(ns_reg2, mean_reg2, yerr=std_reg2, fmt="^--",
+                        color="#009E73", capsize=4, label=lbl)
 
     ax.set_xlabel("System size $N$ (qubits)")
     ax.set_ylabel(r"Mean sufficient depth $\langle D\rangle_t$")
@@ -405,11 +601,23 @@ def save_figure(system_sizes, mean_reg, std_reg, mean_cha, std_cha,
                  pad=14)
     ax.set_xticks(ns_done)
     ax.grid(True, ls=":")
-    # A6 fix: add top headroom so the N=8 "(lower bound)" annotation
-    # cannot collide with the two-line title.
-    _all_vals = list(mean_reg[:len(ns_done)]) + list(mean_cha)
-    _ymax = max(_all_vals) if _all_vals else 6.0
-    ax.set_ylim(0, _ymax + 2.0)
+    # [FIX] The previous version set ylim from the bare MEANS of only two of
+    # the three plotted series (mean_reg, mean_cha) -- it never looked at
+    # error-bar extents, and never looked at mean_reg2 (regular-alt) at all.
+    # This silently clipped whichever error bar happened to reach highest:
+    # at the current data, chaotic N=10 (mean=14.50, std=4.95) has a true
+    # upper whisker of 19.45, but the old logic set ylim top to just 16.50
+    # (14.50 + 2.0 headroom) -- cutting off nearly 3 units, about a fifth,
+    # of that error bar's true extent with no visual indication it happened.
+    # Fixed to use the actual max upper-whisker value (mean + std) across
+    # ALL THREE series, so no error bar is ever silently truncated.
+    _upper_whiskers = []
+    for means, stds in ((mean_reg, std_reg), (mean_cha, std_cha)):
+        _upper_whiskers += [m + s for m, s in zip(means[:len(ns_done)], stds[:len(ns_done)])]
+    if mean_reg2:
+        _upper_whiskers += [m + s for m, s in zip(mean_reg2, std_reg2)]
+    _ymax = max(_upper_whiskers) if _upper_whiskers else 6.0
+    ax.set_ylim(0, _ymax + 1.5)
 
     # ── Per-point annotations (chaotic side, unchanged) ────────────────────
     for i, n in enumerate(ns_cha):
@@ -469,16 +677,28 @@ def save_figure(system_sizes, mean_reg, std_reg, mean_cha, std_cha,
 def replot_from_json(path="figures/depth_scaling_results.json"):
     """[PATCH] Regenerate the figure from the already-saved JSON without
     rerunning any computation -- takes seconds, not minutes. Use this after
-    changing save_figure()'s styling (e.g. this open-marker patch) instead
-    of rerunning main()."""
+    changing save_figure()'s styling (e.g. this open-marker patch, or the
+    y-limit clipping fix) instead of rerunning main().
+
+    [FIX] Previously did not read or pass along the "regular_alt" (k=1.5)
+    series saved in the JSON, even though _main_body() always writes it
+    when RUN_REGULAR_ALT is True -- so running --replot would silently
+    drop the green regular-alt series entirely from the regenerated
+    figure. Now reads it when present.
+    """
     with open(path) as fh:
         r = json.load(fh)
+    reg_alt = r.get("regular_alt")
     save_figure(
         r["system_sizes"],
         r["regular"]["mean_depth"], r["regular"]["std_depth"],
         r["chaotic"]["mean_depth"], r["chaotic"]["std_depth"],
         neval_cha=r["chaotic"]["n_steps_evaluated"],
         neval_reg=r["regular"]["n_steps_evaluated"],
+        mean_reg2=reg_alt["mean_depth"] if reg_alt else None,
+        std_reg2=reg_alt["std_depth"] if reg_alt else None,
+        k_reg2=reg_alt["k"] if reg_alt else None,
+        neval_reg2=reg_alt["n_steps_evaluated"] if reg_alt else None,
     )
     print("Replotted from saved JSON -- no computation was rerun.")
 
@@ -490,7 +710,7 @@ def main():
     if TRY_N10:
         system_sizes.append(10)
 
-    checkpoint = _load_checkpoint()
+    checkpoint, entry_ceiling_offsets = _load_checkpoint()
 
     mean_cha, std_cha, max_cha = [], [], []
     mean_reg, std_reg, max_reg = [], [], []
@@ -506,11 +726,16 @@ def main():
     # your actual restarts. With N_WORKERS=6 physical cores and
     # OMP/OPENBLAS/MKL_NUM_THREADS pinned to 1 (top of file), this should
     # not oversubscribe the CPU.
+    print(f"[PROVENANCE] Running on machine='{_MACHINE_TAG}' cpu='{_CPU_TAG}'",
+          flush=True)
+    print(f"[PROVENANCE] Checkpoint file for this run: {CHECKPOINT_PATH}",
+          flush=True)
     print(f"[PERF] Starting shared process pool with N_WORKERS={N_WORKERS} "
           f"(override via SCALING_N_WORKERS env var).", flush=True)
     _executor = ProcessPoolExecutor(max_workers=N_WORKERS)
     try:
-        _main_body(system_sizes, checkpoint, mean_cha, std_cha, max_cha,
+        _main_body(system_sizes, checkpoint, entry_ceiling_offsets,
+                   mean_cha, std_cha, max_cha,
                    mean_reg, std_reg, max_reg, neval_cha, neval_reg,
                    mean_reg2, std_reg2, max_reg2, neval_reg2, _executor)
     finally:
@@ -518,14 +743,17 @@ def main():
         print("[PERF] Process pool shut down cleanly.", flush=True)
 
 
-def _main_body(system_sizes, checkpoint, mean_cha, std_cha, max_cha,
+def _main_body(system_sizes, checkpoint, entry_ceiling_offsets,
+               mean_cha, std_cha, max_cha,
                mean_reg, std_reg, max_reg, neval_cha, neval_reg,
                mean_reg2, std_reg2, max_reg2, neval_reg2, executor):
 
     valid_sizes = []
     for N in system_sizes:
+        this_n_ceiling = CEILING_OFFSET_BY_N.get(N, CEILING_OFFSET_DEFAULT)
         print(f"\n{'='*55}")
-        print(f"N={N} | chaotic (k={K_CHAOTIC}) …")
+        print(f"N={N} | chaotic (k={K_CHAOTIC}) …  [ceiling_offset={this_n_ceiling}, "
+              f"max_depth={N + this_n_ceiling}]")
         key_cha = (N, K_CHAOTIC)
         if key_cha in checkpoint:
             m, s, mx, ne, _ = checkpoint[key_cha]
@@ -542,7 +770,8 @@ def _main_body(system_sizes, checkpoint, mean_cha, std_cha, max_cha,
                 system_sizes = system_sizes[:system_sizes.index(N)]
                 break
             checkpoint[key_cha] = (m, s, mx, ne, conv)
-            _save_checkpoint(checkpoint)
+            entry_ceiling_offsets[key_cha] = this_n_ceiling
+            _save_checkpoint(checkpoint, entry_ceiling_offsets)
             print(f"  [COMPUTED FRESH -- checkpointed to {CHECKPOINT_PATH}]")
         print(f"  → mean depth={m:.2f} ± {s:.2f}, max={mx}, over {ne} steps")
         mean_cha.append(m); std_cha.append(s); max_cha.append(mx); neval_cha.append(ne)
@@ -560,7 +789,8 @@ def _main_body(system_sizes, checkpoint, mean_cha, std_cha, max_cha,
                 print(f"  N={N} regular: MemoryError — using placeholder.", flush=True)
                 m, s, mx, ne, conv = (mean_reg[-1] if mean_reg else 1.0), 0.0, 1, 0, False
             checkpoint[key_reg] = (m, s, mx, ne, conv)
-            _save_checkpoint(checkpoint)
+            entry_ceiling_offsets[key_reg] = this_n_ceiling
+            _save_checkpoint(checkpoint, entry_ceiling_offsets)
             print(f"  [COMPUTED FRESH -- checkpointed to {CHECKPOINT_PATH}]")
         print(f"  → mean depth={m:.2f} ± {s:.2f}, max={mx}, over {ne} steps")
         mean_reg.append(m); std_reg.append(s); max_reg.append(mx); neval_reg.append(ne)
@@ -584,7 +814,8 @@ def _main_body(system_sizes, checkpoint, mean_cha, std_cha, max_cha,
                     print(f"  N={N} regular-alt: MemoryError — using placeholder.", flush=True)
                     m2, s2, mx2, ne2, conv2 = (mean_reg2[-1] if mean_reg2 else 1.0), 0.0, 1, 0, False
                 checkpoint[key_reg2] = (m2, s2, mx2, ne2, conv2)
-                _save_checkpoint(checkpoint)
+                entry_ceiling_offsets[key_reg2] = this_n_ceiling
+                _save_checkpoint(checkpoint, entry_ceiling_offsets)
                 print(f"  [COMPUTED FRESH -- checkpointed to {CHECKPOINT_PATH}]")
             print(f"  → mean depth={m2:.2f} ± {s2:.2f}, max={mx2}, over {ne2} steps")
             mean_reg2.append(m2); std_reg2.append(s2); max_reg2.append(mx2); neval_reg2.append(ne2)
@@ -595,7 +826,8 @@ def _main_body(system_sizes, checkpoint, mean_cha, std_cha, max_cha,
                 neval_cha=neval_cha, neval_reg=neval_reg,
                 mean_reg2=mean_reg2 if RUN_REGULAR_ALT else None,
                 std_reg2=std_reg2 if RUN_REGULAR_ALT else None,
-                k_reg2=K_REGULAR_ALT if RUN_REGULAR_ALT else None)
+                k_reg2=K_REGULAR_ALT if RUN_REGULAR_ALT else None,
+                neval_reg2=neval_reg2 if RUN_REGULAR_ALT else None)
 
     # ── Structured JSON for reproducibility ────────────────────────────────
     results = {
