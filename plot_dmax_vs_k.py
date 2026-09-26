@@ -379,7 +379,7 @@ def plot_architecture_comparison(k_test, dmax_nn, dmax_alt,
                                  title="Architecture test: NN vs NNN entangler"):
     """Bar chart comparing D_max for NN vs an alternative ansatz at k_test
     values. alt_label/title generalized so this can also produce the
-    NN-vs-all-to-all comparison (Fig. 14 / Appendix C), not just NNN."""
+    NN-vs-all-to-all comparison (Supplementary Note 3 (Fig. S4)), not just NNN."""
     _aps_style()
     os.makedirs(os.path.dirname(outfile) or ".", exist_ok=True)
     x = np.arange(len(k_test))
@@ -446,26 +446,27 @@ if __name__ == "__main__":
     # STEP 2: (vi) eps_opt sensitivity at borderline k values
     # -----------------------------------------------------------------------
     print("\n" + "="*60)
-    print("STEP 2: eps_opt=0.03 sensitivity for k=2.5, 3.0, 3.5")
+    print("STEP 2: eps_opt=0.03 sensitivity -- Table II of the paper")
+    print("        regular plateau k=0.5, 1.0, 1.5 AND chaotic k=2.5, 3.0, 3.5")
     print("="*60)
-    k_border = np.array([2.5, 3.0, 3.5])
-    # [PATCH] All three of STEP 2 now completed in the most recent run
-    # (k=2.5 was restored, k=3.0 and k=3.5 computed fresh). Restored
-    # verbatim so a relaunch only needs to run STEP 3.
+    # Table II of the paper reports D_max(eps_opt=0.03) at SIX kick strengths.
+    # The three chaotic values were cached from an earlier run (below). The
+    # three regular-plateau values are computed fresh here (they were absent
+    # from earlier versions of this script; see README "Reproducing Table II").
+    # A standalone, per-k runner with incremental JSON output is provided in
+    # run_eps003_regular.py for machines where this step must be split up.
+    k_border = np.array([0.5, 1.0, 1.5, 2.5, 3.0, 3.5])
     STEP2_PRECOMPUTED = {
         2.50: (6, 0.088, False),
         3.00: (7, 0.275, False),
         3.50: (7, 0.465, False),
     }
-    dmax_03, _, _, _ = sweep_k(k_border, N=N, steps=STEPS, eps_opt=0.03,
-                               precomputed=STEP2_PRECOMPUTED)
-    # Get corresponding NN values from main sweep
+    dmax_03, _, _, sfracs_03 = sweep_k(k_border, N=N, steps=STEPS, eps_opt=0.03,
+                                       precomputed=STEP2_PRECOMPUTED)
     dmax_nn_border = [dmax[list(K_VALUES).index(k)] for k in k_border]
-    print("\n>>> PASTE INTO PAPER (Sec. Limitations item vi):")
+    print("\n>>> TABLE II (paste into paper):  k | D_max(0.05) | D_max(0.03) | Delta")
     for k_val, d_05, d_03 in zip(k_border, dmax_nn_border, dmax_03):
-        changed = "CHANGED" if d_05 != d_03 else "unchanged"
-        print(f"    k={k_val}: D_max(eps=0.05)={d_05}  "
-              f"D_max(eps=0.03)={d_03}  -> {changed}")
+        print(f"    {k_val:4.2f} | {d_05} | {d_03} | +{int(d_03) - int(d_05)}")
 
     # -----------------------------------------------------------------------
     # STEP 3: (v) Architecture test -- NNN at k=0.5 and k=2.5
@@ -506,7 +507,7 @@ if __name__ == "__main__":
         print("       The resource claim is architecture-specific; caveat in paper.")
 
     # -----------------------------------------------------------------------
-    # STEP 3b: NN vs all-to-all -- the comparison Fig. 14 / Appendix C
+    # STEP 3b: NN vs all-to-all -- the comparison Supplementary Note 3 (Fig. S4)
     # actually reports. NNN (Step 3 above) is explicitly disclaimed in
     # Appendix C as a disconnected-graph artifact at N=6 with "no physical
     # insight" -- it is NOT the architecture-dependence result cited
@@ -514,7 +515,7 @@ if __name__ == "__main__":
     # -----------------------------------------------------------------------
     print("\n" + "="*60)
     print("STEP 3b: Architecture test -- all-to-all entangler at k=0.5 and k=2.5")
-    print("         (this is the comparison Fig. 14 / Appendix C reports)")
+    print("         (this is the comparison Supplementary Note 3 (Fig. S4) reports)")
     print("="*60)
     dmax_ata, _, _, _ = sweep_k(k_arch, N=N, steps=STEPS,
                                 ansatz_type="all_to_all", n_restarts=50,
@@ -524,7 +525,7 @@ if __name__ == "__main__":
         outfile="figures/architecture_test_all_to_all",
         alt_label="All-to-all",
         title="Architecture test: NN vs all-to-all entangler")
-    print("\n>>> PASTE INTO PAPER (Appendix C / Fig. 14):")
+    print("\n>>> PASTE INTO PAPER (Supplementary Note 3 / Fig. S4):")
     for k_val, d_nn, d_ata in zip(k_arch, dmax_nn_arch, dmax_ata):
         same = "same" if d_nn == d_ata else "DIFFERENT"
         print(f"    k={k_val}: D_max(NN)={d_nn}  D_max(all-to-all)={d_ata}  -> {same}")
@@ -539,5 +540,5 @@ if __name__ == "__main__":
     print("Figures produced:")
     print("  figures/dmax_vs_k.{pdf,png}                    <- REPLACES Fig. 10")
     print("  figures/architecture_test.{pdf,png}             <- NNN (reviewer item v)")
-    print("  figures/architecture_test_all_to_all.{pdf,png}  <- ACTUAL Fig. 14 result")
+    print("  figures/architecture_test_all_to_all.{pdf,png}  <- ACTUAL Supplementary Note 3 result")
     print("="*60)
